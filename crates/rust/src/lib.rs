@@ -380,6 +380,8 @@ impl RustWasm {
             return_pointer_area_align: Default::default(),
             needs_runtime_module: false,
             needs_wit_map: false,
+            lift_helpers: Default::default(),
+            lift_helper_bodies: Default::default(),
         }
     }
 

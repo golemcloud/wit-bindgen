@@ -122,6 +122,18 @@ def_instruction! {
         /// Like `I32Load` or `I64Load`, but for loading array length values.
         LengthLoad { offset: ArchitectureSize } : [1] => [1],
 
+        /// Pops a base pointer from the stack, calls a pre-generated, shared
+        /// per-type lift helper function to read and lift the named aggregate
+        /// type `ty` stored at the constant `offset` from that pointer, and
+        /// pushes the lifted value.
+        ///
+        /// This is used to "outline" the canonical-ABI lift of large named
+        /// record/variant types into shared helper functions instead of
+        /// inlining the full recursive lift at every use site. Keeping each
+        /// generated function small avoids the super-linear native-compile cost
+        /// of a single huge function.
+        LiftNamedFromMemory { ty: TypeId, offset: ArchitectureSize } : [1] => [1],
+
         /// Pops a pointer from the stack and then an `i32` value.
         /// Stores the value in little-endian at the pointer specified plus the
         /// constant `offset`.
@@ -791,6 +803,19 @@ pub trait Bindgen {
     /// "canonical" form for lists. This dictates whether the `ListCanonLower`
     /// and `ListCanonLift` instructions are used or not.
     fn is_list_canonical(&self, resolve: &Resolve, element: &Type) -> bool;
+
+    /// Returns the name of a pre-generated, shared lift helper function for the
+    /// named aggregate type `id`, if one exists.
+    ///
+    /// When this returns `Some`, the canonical-ABI lift of that type (in
+    /// `read_from_memory`) is "outlined" into a call to the named helper
+    /// (emitted as `Instruction::LiftNamedFromMemory`) instead of being inlined
+    /// recursively. Generators that do not implement helper outlining should
+    /// return `None` (the default).
+    fn lift_helper_name(&self, resolve: &Resolve, id: TypeId) -> Option<String> {
+        let _ = (resolve, id);
+        None
+    }
 }
 
 /// Generates an abstract sequence of instructions which represents this
@@ -856,6 +881,35 @@ pub fn lift_from_memory<B: Bindgen>(
     ty: &Type,
 ) -> B::Operand {
     let mut generator = Generator::new(resolve, bindgen);
+    generator.read_from_memory(ty, address, Default::default());
+    generator.stack.pop().unwrap()
+}
+
+/// Like [`lift_from_memory`], but used to generate the *body* of an outlined
+/// lift helper for the named type `skip_outline_root`.
+///
+/// The root type itself is lifted inline (one level deep) while nested named
+/// aggregate types are outlined into calls to their own shared helpers (see
+/// [`Bindgen::lift_helper_name`] and [`Instruction::LiftNamedFromMemory`]).
+///
+/// `skip_outline_root` must be the id of the named aggregate (record/variant)
+/// being lifted, and `ty` must be exactly `Type::Id(skip_outline_root)` (not an
+/// alias to it) so that the single-shot inline of the root in `read_from_memory`
+/// lands on the intended type.
+pub fn lift_from_memory_root<B: Bindgen>(
+    resolve: &Resolve,
+    bindgen: &mut B,
+    address: B::Operand,
+    ty: &Type,
+    skip_outline_root: TypeId,
+) -> B::Operand {
+    assert!(
+        matches!(ty, Type::Id(id) if *id == skip_outline_root),
+        "lift_from_memory_root requires `ty` to be `Type::Id(skip_outline_root)`, \
+         not an alias or other type"
+    );
+    let mut generator = Generator::new(resolve, bindgen);
+    generator.lift_outline_root = Some(skip_outline_root);
     generator.read_from_memory(ty, address, Default::default());
     generator.stack.pop().unwrap()
 }
@@ -1001,6 +1055,11 @@ struct Generator<'a, B: Bindgen> {
     stack: Vec<B::Operand>,
     return_pointer: Option<B::Operand>,
     realloc: Option<Realloc>,
+    /// When generating the body of an outlined lift helper for a named type,
+    /// this holds that type's id so its *own* top-level lift is inlined (one
+    /// level) while nested named aggregates are still outlined into their own
+    /// helpers. `None` everywhere else (so all eligible named types outline).
+    lift_outline_root: Option<TypeId>,
 }
 
 const MAX_FLAT_PARAMS: usize = 16;
@@ -1016,6 +1075,7 @@ impl<'a, B: Bindgen> Generator<'a, B> {
             stack: Vec::new(),
             return_pointer: None,
             realloc: None,
+            lift_outline_root: None,
         }
     }
 
@@ -2177,7 +2237,20 @@ impl<'a, B: Bindgen> Generator<'a, B> {
             Type::String => self.read_list_from_memory(ty, addr, offset),
             Type::ErrorContext => self.emit_and_lift(ty, addr, &I32Load { offset }),
 
-            Type::Id(id) => match &self.resolve.types[id].kind {
+            Type::Id(id) => {
+                // Outline the lift of large named aggregate types into shared
+                // helper functions instead of inlining the full recursive lift
+                // here. `lift_outline_root` is `Some(id)` only while generating
+                // that type's own helper body, in which case its top level is
+                // inlined (one level) and nested types still outline.
+                let is_outline_root = self.lift_outline_root == Some(id);
+                self.lift_outline_root = None;
+                if !is_outline_root && self.bindgen.lift_helper_name(self.resolve, id).is_some() {
+                    self.stack.push(addr);
+                    self.emit(&Instruction::LiftNamedFromMemory { ty: id, offset });
+                    return;
+                }
+                match &self.resolve.types[id].kind {
                 TypeDefKind::Type(t) => self.read_from_memory(t, addr, offset),
 
                 TypeDefKind::List(_) => self.read_list_from_memory(ty, addr, offset),
@@ -2284,7 +2357,8 @@ impl<'a, B: Bindgen> Generator<'a, B> {
                         id,
                     });
                 }
-            },
+                }
+            }
         }
     }
 

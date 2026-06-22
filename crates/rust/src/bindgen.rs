@@ -22,6 +22,16 @@ pub(super) struct FunctionBindgen<'a, 'b> {
     pub handle_decls: Vec<String>,
     always_owned: bool,
     return_self: bool,
+    /// Whether outlined lift helpers may be used for this snippet.
+    ///
+    /// Lift helpers are emitted as free functions in the interface module, and
+    /// outlined calls to them are unqualified, so they only resolve for code
+    /// emitted directly in that same module (import wrappers and the helper
+    /// bodies themselves). Code emitted into a nested submodule — notably the
+    /// `future`/`stream` payload vtables, which live in a separate module tree —
+    /// must not outline; it lifts inline instead. Such payload `lift` functions
+    /// are already isolated single-value lifts, so this loses no benefit.
+    pub(super) outline_lifts: bool,
 }
 
 pub const POINTER_SIZE_EXPRESSION: &str = "::core::mem::size_of::<*const u8>()";
@@ -48,6 +58,7 @@ impl<'a, 'b> FunctionBindgen<'a, 'b> {
             handle_decls: Vec::new(),
             always_owned,
             return_self,
+            outline_lifts: true,
         }
     }
 
@@ -265,6 +276,13 @@ impl Bindgen for FunctionBindgen<'_, '_> {
 
     fn is_list_canonical(&self, _resolve: &Resolve, ty: &Type) -> bool {
         self.r#gen.is_list_canonical(ty)
+    }
+
+    fn lift_helper_name(&self, _resolve: &Resolve, id: TypeId) -> Option<String> {
+        if !self.outline_lifts {
+            return None;
+        }
+        self.r#gen.lift_helpers.get(&id).cloned()
     }
 
     fn emit(
@@ -1174,6 +1192,20 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                     offset.format_term(POINTER_SIZE_EXPRESSION, true)
                 );
                 results.push(format!("l{tmp}"));
+            }
+
+            Instruction::LiftNamedFromMemory { ty, offset } => {
+                let name = self
+                    .lift_helper_name(resolve, *ty)
+                    .expect("lift helper must be registered before it is emitted");
+                let tmp = self.tmp();
+                uwriteln!(
+                    self.src,
+                    "let result{tmp} = {name}({base}.add({offset}));",
+                    base = operands[0],
+                    offset = offset.format_term(POINTER_SIZE_EXPRESSION, true),
+                );
+                results.push(format!("result{tmp}"));
             }
 
             Instruction::I32Store { offset } => {

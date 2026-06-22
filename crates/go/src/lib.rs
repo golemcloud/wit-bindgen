@@ -1995,6 +1995,10 @@ return {results}"
             Instruction::LengthLoad { offset } => {
                 load(self, results, &operands[0], offset, "uint32", &|v| v)
             }
+            Instruction::LiftNamedFromMemory { .. } => unreachable!(
+                "LiftNamedFromMemory is only emitted by generators that implement \
+                 Bindgen::lift_helper_name, which this generator does not"
+            ),
             Instruction::PointerLoad { offset } => {
                 load(self, results, &operands[0], offset, "uint32", &|v| {
                     format!("uintptr({v})")

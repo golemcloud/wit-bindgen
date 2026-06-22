@@ -464,6 +464,10 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                     offset = offset.size_wasm32()
                 ))
             }
+            Instruction::LiftNamedFromMemory { .. } => unreachable!(
+                "LiftNamedFromMemory is only emitted by generators that implement \
+                 Bindgen::lift_helper_name, which this generator does not"
+            ),
             Instruction::PointerLoad { offset } => results.push(format!(
                 "new global::System.Span<nint>((void*)((byte*){} + {offset}), 1)[0]",
                 operands[0],

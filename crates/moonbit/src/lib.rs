@@ -2376,6 +2376,11 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                 ))
             }
 
+            Instruction::LiftNamedFromMemory { .. } => unreachable!(
+                "LiftNamedFromMemory is only emitted by generators that implement \
+                 Bindgen::lift_helper_name, which this generator does not"
+            ),
+
             Instruction::I32Load8U { offset } => {
                 self.use_ffi(ffi::LOAD8_U);
                 results.push(format!(
