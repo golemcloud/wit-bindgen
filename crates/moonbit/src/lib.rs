@@ -16,7 +16,7 @@ use wit_bindgen_core::{
         Alignment, ArchitectureSize, Docs, Enum, Flags, FlagsRepr, Function, Int, InterfaceId,
         LiftLowerAbi, LiveTypes, ManglingAndAbi, Param, Record, Resolve, ResourceIntrinsic,
         Result_, SizeAlign, Tuple, Type, TypeDefKind, TypeId, Variant, WasmExport, WasmExportKind,
-        WasmImport, WorldId, WorldKey,
+        WasmImport, WorldId, WorldItem, WorldKey,
     },
 };
 
@@ -113,6 +113,34 @@ impl InterfaceFragment {
     }
 }
 
+/// Sanitizes a WIT export identity into a stable MoonBit-identifier suffix used
+/// to disambiguate `wasmExport*` names that collide across the world's exports.
+/// `golem:agent/guest` -> `GolemAgentGuest`, world `agent-guest` -> `AgentGuest`.
+/// Any `@version` segment is stripped so the suffix does not change when a
+/// dependency is bumped.
+fn export_disambiguator(resolve: &Resolve, key: Option<&WorldKey>, world: WorldId) -> String {
+    let raw: String = match key {
+        Some(k) => resolve.name_world_key(k),
+        None => resolve.worlds[world].name.clone(),
+    };
+    let raw = match raw.rfind('@') {
+        Some(i) => &raw[..i],
+        None => raw.as_str(),
+    };
+    let mut out = String::new();
+    for part in raw.split([':', '/', '-', '_']) {
+        if part.is_empty() {
+            continue;
+        }
+        let mut chars = part.chars();
+        if let Some(c) = chars.next() {
+            out.push(c.to_ascii_uppercase());
+            out.push_str(chars.as_str());
+        }
+    }
+    out
+}
+
 #[derive(Default)]
 pub struct MoonBit {
     opts: Opts,
@@ -129,6 +157,14 @@ pub struct MoonBit {
     export: HashMap<String, (String, String)>,
 
     export_ns: Ns,
+
+    /// Stable per-export disambiguators for `wasmExport*` names that collide
+    /// across the world's exports (e.g. `invoke` exported by both
+    /// `golem:agent/guest` and `golem:tool/guest`). Computed once in
+    /// `preprocess` from the exporting interface's identity, so the generated
+    /// names no longer depend on `world.exports` iteration order. Keyed by
+    /// `(interface key, function name)`; unique exports are absent.
+    disambiguators: HashMap<(Option<WorldKey>, String), String>,
 
     async_support: AsyncSupport,
 }
@@ -264,6 +300,36 @@ impl WorldGenerator for MoonBit {
             }))
             .unwrap_or("generated".into());
         self.sizes.fill(resolve);
+
+        let mut groups: HashMap<String, Vec<(Option<WorldKey>, String)>> = HashMap::new();
+        for (key, item) in &resolve.worlds[world].exports {
+            match item {
+                WorldItem::Interface { id, .. } => {
+                    for (fname, _) in &resolve.interfaces[*id].functions {
+                        let base = format!("wasmExport{}", fname.to_upper_camel_case());
+                        groups
+                            .entry(base)
+                            .or_default()
+                            .push((Some(key.clone()), fname.clone()));
+                    }
+                }
+                WorldItem::Function(f) => {
+                    let base = format!("wasmExport{}", f.name.to_upper_camel_case());
+                    groups.entry(base).or_default().push((None, f.name.clone()));
+                }
+                WorldItem::Type { .. } => {}
+            }
+        }
+        let mut disambiguators = HashMap::new();
+        for entries in groups.values() {
+            if entries.len() > 1 {
+                for (key, fname) in entries {
+                    let disambig = export_disambiguator(resolve, key.as_ref(), world);
+                    disambiguators.insert((key.clone(), fname.clone()), disambig);
+                }
+            }
+        }
+        self.disambiguators = disambiguators;
         Ok(())
     }
 
@@ -696,10 +762,8 @@ impl InterfaceGenerator<'_> {
                 // `ptr1`, ... instead of `ptr`, which would shadow the `ptr`
                 // parameter and make subsequent `(ptr) + offset` stores write
                 // to the string's own buffer instead of the result base.
-                let mut f = FunctionBindgen::new(
-                    self,
-                    Box::new(["ptr".to_string(), "value".to_string()]),
-                );
+                let mut f =
+                    FunctionBindgen::new(self, Box::new(["ptr".to_string(), "value".to_string()]));
                 abi::lower_to_memory_root(
                     resolve,
                     &mut f,
@@ -887,10 +951,17 @@ impl InterfaceGenerator<'_> {
 
         let camel_name = func.name.to_upper_camel_case();
 
+        let disambig = self
+            .world_gen
+            .disambiguators
+            .get(&(self.interface.cloned(), func.name.to_string()))
+            .cloned()
+            .unwrap_or_default();
+
         let func_name = self
             .world_gen
             .export_ns
-            .tmp(&format!("wasmExport{camel_name}"));
+            .tmp(&format!("wasmExport{camel_name}{disambig}"));
 
         let params = sig
             .params
@@ -959,6 +1030,7 @@ impl InterfaceGenerator<'_> {
             self.interface,
             func,
             &camel_name,
+            &disambig,
             async_state,
         ) && abi::guest_export_needs_post_return(self.resolve, func)
         {
@@ -985,7 +1057,7 @@ impl InterfaceGenerator<'_> {
             let func_name = self
                 .world_gen
                 .export_ns
-                .tmp(&format!("wasmExport{camel_name}PostReturn"));
+                .tmp(&format!("wasmExport{camel_name}{disambig}PostReturn"));
 
             uwrite!(
                 self.ffi,

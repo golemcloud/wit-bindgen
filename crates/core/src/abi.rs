@@ -2107,121 +2107,125 @@ impl<'a, B: Bindgen> Generator<'a, B> {
                     return;
                 }
                 match &self.resolve.types[id].kind {
-                TypeDefKind::Type(t) => self.write_to_memory(t, addr, offset),
-                TypeDefKind::List(_) => self.write_list_to_memory(ty, addr, offset),
-                // Maps have the same linear memory layout as list<tuple<K, V>>.
-                TypeDefKind::Map(_, _) => self.write_list_to_memory(ty, addr, offset),
+                    TypeDefKind::Type(t) => self.write_to_memory(t, addr, offset),
+                    TypeDefKind::List(_) => self.write_list_to_memory(ty, addr, offset),
+                    // Maps have the same linear memory layout as list<tuple<K, V>>.
+                    TypeDefKind::Map(_, _) => self.write_list_to_memory(ty, addr, offset),
 
-                TypeDefKind::Future(_) | TypeDefKind::Stream(_) | TypeDefKind::Handle(_) => {
-                    self.lower_and_emit(ty, addr, &I32Store { offset })
-                }
+                    TypeDefKind::Future(_) | TypeDefKind::Stream(_) | TypeDefKind::Handle(_) => {
+                        self.lower_and_emit(ty, addr, &I32Store { offset })
+                    }
 
-                // Decompose the record into its components and then write all
-                // the components into memory one-by-one.
-                TypeDefKind::Record(record) => {
-                    self.emit(&RecordLower {
-                        record,
-                        ty: id,
-                        name: self.resolve.types[id].name.as_deref().unwrap(),
-                    });
-                    self.write_fields_to_memory(record.fields.iter().map(|f| &f.ty), addr, offset);
-                }
-                TypeDefKind::Resource => {
-                    todo!()
-                }
-                TypeDefKind::Tuple(tuple) => {
-                    self.emit(&TupleLower { tuple, ty: id });
-                    self.write_fields_to_memory(tuple.types.iter(), addr, offset);
-                }
+                    // Decompose the record into its components and then write all
+                    // the components into memory one-by-one.
+                    TypeDefKind::Record(record) => {
+                        self.emit(&RecordLower {
+                            record,
+                            ty: id,
+                            name: self.resolve.types[id].name.as_deref().unwrap(),
+                        });
+                        self.write_fields_to_memory(
+                            record.fields.iter().map(|f| &f.ty),
+                            addr,
+                            offset,
+                        );
+                    }
+                    TypeDefKind::Resource => {
+                        todo!()
+                    }
+                    TypeDefKind::Tuple(tuple) => {
+                        self.emit(&TupleLower { tuple, ty: id });
+                        self.write_fields_to_memory(tuple.types.iter(), addr, offset);
+                    }
 
-                TypeDefKind::Flags(f) => {
-                    self.lower(ty);
-                    match f.repr() {
-                        FlagsRepr::U8 => {
-                            self.stack.push(addr);
-                            self.store_intrepr(offset, Int::U8);
-                        }
-                        FlagsRepr::U16 => {
-                            self.stack.push(addr);
-                            self.store_intrepr(offset, Int::U16);
-                        }
-                        FlagsRepr::U32(n) => {
-                            for i in (0..n).rev() {
-                                self.stack.push(addr.clone());
-                                self.emit(&I32Store {
-                                    offset: offset.add_bytes(i * 4),
-                                });
+                    TypeDefKind::Flags(f) => {
+                        self.lower(ty);
+                        match f.repr() {
+                            FlagsRepr::U8 => {
+                                self.stack.push(addr);
+                                self.store_intrepr(offset, Int::U8);
+                            }
+                            FlagsRepr::U16 => {
+                                self.stack.push(addr);
+                                self.store_intrepr(offset, Int::U16);
+                            }
+                            FlagsRepr::U32(n) => {
+                                for i in (0..n).rev() {
+                                    self.stack.push(addr.clone());
+                                    self.emit(&I32Store {
+                                        offset: offset.add_bytes(i * 4),
+                                    });
+                                }
                             }
                         }
                     }
-                }
 
-                // Each case will get its own block, and the first item in each
-                // case is writing the discriminant. After that if we have a
-                // payload we write the payload after the discriminant, aligned up
-                // to the type's alignment.
-                TypeDefKind::Variant(v) => {
-                    self.write_variant_arms_to_memory(
-                        offset,
-                        addr,
-                        v.tag(),
-                        v.cases.iter().map(|c| c.ty.as_ref()),
-                    );
-                    self.emit(&VariantLower {
-                        variant: v,
-                        ty: id,
-                        results: &[],
-                        name: self.resolve.types[id].name.as_deref().unwrap(),
-                    });
-                }
+                    // Each case will get its own block, and the first item in each
+                    // case is writing the discriminant. After that if we have a
+                    // payload we write the payload after the discriminant, aligned up
+                    // to the type's alignment.
+                    TypeDefKind::Variant(v) => {
+                        self.write_variant_arms_to_memory(
+                            offset,
+                            addr,
+                            v.tag(),
+                            v.cases.iter().map(|c| c.ty.as_ref()),
+                        );
+                        self.emit(&VariantLower {
+                            variant: v,
+                            ty: id,
+                            results: &[],
+                            name: self.resolve.types[id].name.as_deref().unwrap(),
+                        });
+                    }
 
-                TypeDefKind::Option(t) => {
-                    self.write_variant_arms_to_memory(offset, addr, Int::U8, [None, Some(t)]);
-                    self.emit(&OptionLower {
-                        payload: t,
-                        ty: id,
-                        results: &[],
-                    });
-                }
+                    TypeDefKind::Option(t) => {
+                        self.write_variant_arms_to_memory(offset, addr, Int::U8, [None, Some(t)]);
+                        self.emit(&OptionLower {
+                            payload: t,
+                            ty: id,
+                            results: &[],
+                        });
+                    }
 
-                TypeDefKind::Result(r) => {
-                    self.write_variant_arms_to_memory(
-                        offset,
-                        addr,
-                        Int::U8,
-                        [r.ok.as_ref(), r.err.as_ref()],
-                    );
-                    self.emit(&ResultLower {
-                        result: r,
-                        ty: id,
-                        results: &[],
-                    });
-                }
+                    TypeDefKind::Result(r) => {
+                        self.write_variant_arms_to_memory(
+                            offset,
+                            addr,
+                            Int::U8,
+                            [r.ok.as_ref(), r.err.as_ref()],
+                        );
+                        self.emit(&ResultLower {
+                            result: r,
+                            ty: id,
+                            results: &[],
+                        });
+                    }
 
-                TypeDefKind::Enum(e) => {
-                    self.lower(ty);
-                    self.stack.push(addr);
-                    self.store_intrepr(offset, e.tag());
-                }
+                    TypeDefKind::Enum(e) => {
+                        self.lower(ty);
+                        self.stack.push(addr);
+                        self.store_intrepr(offset, e.tag());
+                    }
 
-                TypeDefKind::Unknown => unreachable!(),
-                TypeDefKind::FixedLengthList(element, size) => {
-                    // resembles write_list_to_memory
-                    self.push_block();
-                    self.emit(&IterElem { element });
-                    self.emit(&IterBasePointer);
-                    let elem_addr = self.stack.pop().unwrap();
-                    self.write_to_memory(element, elem_addr, offset);
-                    self.finish_block(0);
-                    self.stack.push(addr);
-                    self.emit(&FixedLengthListLowerToMemory {
-                        element,
-                        size: *size,
-                        id,
-                    });
+                    TypeDefKind::Unknown => unreachable!(),
+                    TypeDefKind::FixedLengthList(element, size) => {
+                        // resembles write_list_to_memory
+                        self.push_block();
+                        self.emit(&IterElem { element });
+                        self.emit(&IterBasePointer);
+                        let elem_addr = self.stack.pop().unwrap();
+                        self.write_to_memory(element, elem_addr, offset);
+                        self.finish_block(0);
+                        self.stack.push(addr);
+                        self.emit(&FixedLengthListLowerToMemory {
+                            element,
+                            size: *size,
+                            id,
+                        });
+                    }
                 }
-                }
-            },
+            }
         }
     }
 
@@ -2329,112 +2333,116 @@ impl<'a, B: Bindgen> Generator<'a, B> {
                     return;
                 }
                 match &self.resolve.types[id].kind {
-                TypeDefKind::Type(t) => self.read_from_memory(t, addr, offset),
+                    TypeDefKind::Type(t) => self.read_from_memory(t, addr, offset),
 
-                TypeDefKind::List(_) => self.read_list_from_memory(ty, addr, offset),
-                // Maps have the same linear memory layout as list<tuple<K, V>>.
-                TypeDefKind::Map(_, _) => self.read_list_from_memory(ty, addr, offset),
+                    TypeDefKind::List(_) => self.read_list_from_memory(ty, addr, offset),
+                    // Maps have the same linear memory layout as list<tuple<K, V>>.
+                    TypeDefKind::Map(_, _) => self.read_list_from_memory(ty, addr, offset),
 
-                TypeDefKind::Future(_) | TypeDefKind::Stream(_) | TypeDefKind::Handle(_) => {
-                    self.emit_and_lift(ty, addr, &I32Load { offset })
-                }
+                    TypeDefKind::Future(_) | TypeDefKind::Stream(_) | TypeDefKind::Handle(_) => {
+                        self.emit_and_lift(ty, addr, &I32Load { offset })
+                    }
 
-                TypeDefKind::Resource => {
-                    todo!();
-                }
+                    TypeDefKind::Resource => {
+                        todo!();
+                    }
 
-                // Read and lift each field individually, adjusting the offset
-                // as we go along, then aggregate all the fields into the
-                // record.
-                TypeDefKind::Record(record) => {
-                    self.read_fields_from_memory(record.fields.iter().map(|f| &f.ty), addr, offset);
-                    self.emit(&RecordLift {
-                        record,
-                        ty: id,
-                        name: self.resolve.types[id].name.as_deref().unwrap(),
-                    });
-                }
+                    // Read and lift each field individually, adjusting the offset
+                    // as we go along, then aggregate all the fields into the
+                    // record.
+                    TypeDefKind::Record(record) => {
+                        self.read_fields_from_memory(
+                            record.fields.iter().map(|f| &f.ty),
+                            addr,
+                            offset,
+                        );
+                        self.emit(&RecordLift {
+                            record,
+                            ty: id,
+                            name: self.resolve.types[id].name.as_deref().unwrap(),
+                        });
+                    }
 
-                TypeDefKind::Tuple(tuple) => {
-                    self.read_fields_from_memory(&tuple.types, addr, offset);
-                    self.emit(&TupleLift { tuple, ty: id });
-                }
+                    TypeDefKind::Tuple(tuple) => {
+                        self.read_fields_from_memory(&tuple.types, addr, offset);
+                        self.emit(&TupleLift { tuple, ty: id });
+                    }
 
-                TypeDefKind::Flags(f) => {
-                    match f.repr() {
-                        FlagsRepr::U8 => {
-                            self.stack.push(addr);
-                            self.load_intrepr(offset, Int::U8);
-                        }
-                        FlagsRepr::U16 => {
-                            self.stack.push(addr);
-                            self.load_intrepr(offset, Int::U16);
-                        }
-                        FlagsRepr::U32(n) => {
-                            for i in 0..n {
-                                self.stack.push(addr.clone());
-                                self.emit(&I32Load {
-                                    offset: offset.add_bytes(i * 4),
-                                });
+                    TypeDefKind::Flags(f) => {
+                        match f.repr() {
+                            FlagsRepr::U8 => {
+                                self.stack.push(addr);
+                                self.load_intrepr(offset, Int::U8);
+                            }
+                            FlagsRepr::U16 => {
+                                self.stack.push(addr);
+                                self.load_intrepr(offset, Int::U16);
+                            }
+                            FlagsRepr::U32(n) => {
+                                for i in 0..n {
+                                    self.stack.push(addr.clone());
+                                    self.emit(&I32Load {
+                                        offset: offset.add_bytes(i * 4),
+                                    });
+                                }
                             }
                         }
+                        self.lift(ty);
                     }
-                    self.lift(ty);
-                }
 
-                // Each case will get its own block, and we'll dispatch to the
-                // right block based on the `i32.load` we initially perform. Each
-                // individual block is pretty simple and just reads the payload type
-                // from the corresponding offset if one is available.
-                TypeDefKind::Variant(variant) => {
-                    self.read_variant_arms_from_memory(
-                        offset,
-                        addr,
-                        variant.tag(),
-                        variant.cases.iter().map(|c| c.ty.as_ref()),
-                    );
-                    self.emit(&VariantLift {
-                        variant,
-                        ty: id,
-                        name: self.resolve.types[id].name.as_deref().unwrap(),
-                    });
-                }
+                    // Each case will get its own block, and we'll dispatch to the
+                    // right block based on the `i32.load` we initially perform. Each
+                    // individual block is pretty simple and just reads the payload type
+                    // from the corresponding offset if one is available.
+                    TypeDefKind::Variant(variant) => {
+                        self.read_variant_arms_from_memory(
+                            offset,
+                            addr,
+                            variant.tag(),
+                            variant.cases.iter().map(|c| c.ty.as_ref()),
+                        );
+                        self.emit(&VariantLift {
+                            variant,
+                            ty: id,
+                            name: self.resolve.types[id].name.as_deref().unwrap(),
+                        });
+                    }
 
-                TypeDefKind::Option(t) => {
-                    self.read_variant_arms_from_memory(offset, addr, Int::U8, [None, Some(t)]);
-                    self.emit(&OptionLift { payload: t, ty: id });
-                }
+                    TypeDefKind::Option(t) => {
+                        self.read_variant_arms_from_memory(offset, addr, Int::U8, [None, Some(t)]);
+                        self.emit(&OptionLift { payload: t, ty: id });
+                    }
 
-                TypeDefKind::Result(r) => {
-                    self.read_variant_arms_from_memory(
-                        offset,
-                        addr,
-                        Int::U8,
-                        [r.ok.as_ref(), r.err.as_ref()],
-                    );
-                    self.emit(&ResultLift { result: r, ty: id });
-                }
+                    TypeDefKind::Result(r) => {
+                        self.read_variant_arms_from_memory(
+                            offset,
+                            addr,
+                            Int::U8,
+                            [r.ok.as_ref(), r.err.as_ref()],
+                        );
+                        self.emit(&ResultLift { result: r, ty: id });
+                    }
 
-                TypeDefKind::Enum(e) => {
-                    self.stack.push(addr.clone());
-                    self.load_intrepr(offset, e.tag());
-                    self.lift(ty);
-                }
+                    TypeDefKind::Enum(e) => {
+                        self.stack.push(addr.clone());
+                        self.load_intrepr(offset, e.tag());
+                        self.lift(ty);
+                    }
 
-                TypeDefKind::Unknown => unreachable!(),
-                TypeDefKind::FixedLengthList(ty, size) => {
-                    self.push_block();
-                    self.emit(&IterBasePointer);
-                    let elemaddr = self.stack.pop().unwrap();
-                    self.read_from_memory(ty, elemaddr, offset);
-                    self.finish_block(1);
-                    self.stack.push(addr.clone());
-                    self.emit(&FixedLengthListLiftFromMemory {
-                        element: ty,
-                        size: *size,
-                        id,
-                    });
-                }
+                    TypeDefKind::Unknown => unreachable!(),
+                    TypeDefKind::FixedLengthList(ty, size) => {
+                        self.push_block();
+                        self.emit(&IterBasePointer);
+                        let elemaddr = self.stack.pop().unwrap();
+                        self.read_from_memory(ty, elemaddr, offset);
+                        self.finish_block(1);
+                        self.stack.push(addr.clone());
+                        self.emit(&FixedLengthListLiftFromMemory {
+                            element: ty,
+                            size: *size,
+                            id,
+                        });
+                    }
                 }
             }
         }

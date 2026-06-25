@@ -819,6 +819,7 @@ impl<'a> InterfaceGenerator<'a> {
         interface: Option<&WorldKey>,
         func: &Function,
         camel_name: &str,
+        disambig: &str,
         async_state: AsyncFunctionState,
     ) -> bool {
         if !plan.is_async() {
@@ -828,7 +829,7 @@ impl<'a> InterfaceGenerator<'a> {
         let export_func_name = self
             .world_gen
             .export_ns
-            .tmp(&format!("wasmExportAsync{camel_name}"));
+            .tmp(&format!("wasmExportAsync{camel_name}{disambig}"));
         let AsyncTaskReturnState::Emitted {
             body: task_return_body,
             needs_cleanup_list: task_return_needs_cleanup,
