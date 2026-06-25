@@ -468,6 +468,10 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                 "LiftNamedFromMemory is only emitted by generators that implement \
                  Bindgen::lift_helper_name, which this generator does not"
             ),
+            Instruction::LowerNamedToMemory { .. } => unreachable!(
+                "LowerNamedToMemory is only emitted by generators that implement \
+                 Bindgen::lower_helper_name, which this generator does not"
+            ),
             Instruction::PointerLoad { offset } => results.push(format!(
                 "new global::System.Span<nint>((void*)((byte*){} + {offset}), 1)[0]",
                 operands[0],

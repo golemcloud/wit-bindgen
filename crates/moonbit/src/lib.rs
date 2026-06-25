@@ -2,7 +2,7 @@ use anyhow::Result;
 use core::panic;
 use heck::{ToShoutySnakeCase, ToUpperCamelCase};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt::Write,
     mem,
     ops::Deref,
@@ -152,6 +152,7 @@ impl MoonBit {
             ffi_imports: HashSet::new(),
             derive_opts,
             interface,
+            lower_helpers: BTreeMap::new(),
         }
     }
 
@@ -424,6 +425,8 @@ impl WorldGenerator for MoonBit {
             r#gen.export(func);
         }
 
+        r#gen.generate_lower_helper_bodies();
+
         let fragment = r#gen.finish();
 
         // Write files
@@ -487,6 +490,8 @@ impl WorldGenerator for MoonBit {
         for (_, func) in funcs {
             r#gen.export(func);
         }
+
+        r#gen.generate_lower_helper_bodies();
 
         let fragment = r#gen.finish();
 
@@ -585,6 +590,14 @@ struct InterfaceGenerator<'a> {
 
     // Options for deriving traits
     derive_opts: DeriveOpts,
+
+    // Shared lower-to-memory helper functions for named aggregate types
+    // (records/variants) reached from memory-lowered guest-export results. The
+    // helper for a given `TypeId` is emitted once and called from every
+    // `wasmExport*` glue function that lowers a value of that type, instead of
+    // inlining the full recursive lower at each call site. This keeps the
+    // generated `wasmExport*` functions small enough for `moonc` to compile.
+    lower_helpers: BTreeMap<TypeId, String>,
 }
 
 impl InterfaceGenerator<'_> {
@@ -593,6 +606,131 @@ impl InterfaceGenerator<'_> {
             src: self.src,
             ffi: self.ffi,
             builtins: self.ffi_imports,
+        }
+    }
+
+    /// Recursively registers a shared lower-to-memory helper for `ty` and
+    /// every named aggregate type (record/variant) reachable from it. Only
+    /// records names here; bodies are generated later by
+    /// [`Self::generate_lower_helper_bodies`].
+    ///
+    /// Mirrors the Rust backend's `register_lift_helpers`, but for the lower
+    /// side. Outlining the recursive lower into one helper per aggregate type
+    /// keeps the generated `wasmExport*` glue functions small enough for
+    /// `moonc` to compile (a single inlined lower of a deeply nested variant
+    /// can balloon the per-function IR past `moonc`'s limits).
+    fn register_lower_helpers(&mut self, ty: &Type) {
+        let Type::Id(id) = ty else { return };
+        let id = *id;
+        match &self.resolve.types[id].kind {
+            TypeDefKind::Type(t) => {
+                let t = *t;
+                self.register_lower_helpers(&t);
+            }
+            TypeDefKind::Record(_) | TypeDefKind::Variant(_) => {
+                if self.lower_helpers.contains_key(&id) {
+                    return;
+                }
+                let name = format!("__wit_bindgen_lower_t{}", id.index());
+                self.lower_helpers.insert(id, name);
+                // Collect child types first to avoid borrow conflicts.
+                let children: Vec<Type> = match &self.resolve.types[id].kind {
+                    TypeDefKind::Record(r) => r.fields.iter().map(|f| f.ty).collect(),
+                    TypeDefKind::Variant(v) => v.cases.iter().filter_map(|c| c.ty).collect(),
+                    _ => Vec::new(),
+                };
+                for child in children {
+                    self.register_lower_helpers(&child);
+                }
+            }
+            TypeDefKind::List(t) | TypeDefKind::Option(t) | TypeDefKind::FixedLengthList(t, _) => {
+                let t = *t;
+                self.register_lower_helpers(&t);
+            }
+            TypeDefKind::Tuple(tuple) => {
+                let tys: Vec<Type> = tuple.types.clone();
+                for t in tys {
+                    self.register_lower_helpers(&t);
+                }
+            }
+            TypeDefKind::Result(r) => {
+                if let Some(t) = r.ok {
+                    self.register_lower_helpers(&t);
+                }
+                if let Some(t) = r.err {
+                    self.register_lower_helpers(&t);
+                }
+            }
+            TypeDefKind::Map(k, v) => {
+                let k = *k;
+                let v = *v;
+                self.register_lower_helpers(&k);
+                self.register_lower_helpers(&v);
+            }
+            _ => {}
+        }
+    }
+
+    /// Generates the body of every registered lower helper into `self.ffi`.
+    ///
+    /// Each helper has the signature `fn name(ptr : Int, value : T) -> Unit` and
+    /// writes `value` to linear memory at `ptr` using the canonical ABI. The
+    /// root type is lowered inline (one level deep) via
+    /// [`abi::lower_to_memory_root`]; nested named aggregates are outlined
+    /// into calls to their own helpers.
+    fn generate_lower_helper_bodies(&mut self) {
+        let ids: Vec<TypeId> = self.lower_helpers.keys().copied().collect();
+        let resolve = self.resolve;
+        for id in ids {
+            let name = self.lower_helpers[&id].clone();
+            let ty = Type::Id(id);
+            let value_ty = self.world_gen.pkg_resolver.type_name(self.name, &ty);
+
+            // The helper body is generated in a borrow scope so that
+            // `FunctionBindgen`'s borrow of `self` ends before we write the
+            // finished body into `self.ffi` below.
+            let body = {
+                // Reserve the helper's parameter names (`ptr`, `value`) in the
+                // local namespace so that lowering temps such as the string /
+                // canonical-list pointer (`locals.tmp("ptr")`) become `ptr0`,
+                // `ptr1`, ... instead of `ptr`, which would shadow the `ptr`
+                // parameter and make subsequent `(ptr) + offset` stores write
+                // to the string's own buffer instead of the result base.
+                let mut f = FunctionBindgen::new(
+                    self,
+                    Box::new(["ptr".to_string(), "value".to_string()]),
+                );
+                abi::lower_to_memory_root(
+                    resolve,
+                    &mut f,
+                    "ptr".to_string(),
+                    "value".to_string(),
+                    &ty,
+                    id,
+                );
+                let body = mem::take(&mut f.src);
+
+                // A pure lower-to-memory of a record/variant allocates the
+                // result buffers via `cabi_realloc` (handed off to the caller)
+                // and must not require any of the side state that `export`
+                // would otherwise flush into the surrounding function. Assert
+                // the assumption holds rather than silently emitting broken
+                // code if a future lower path starts depending on them.
+                assert!(
+                    !f.needs_cleanup_list,
+                    "outlined lower helper unexpectedly requires a cleanup list"
+                );
+                assert!(
+                    f.cleanup.is_empty(),
+                    "outlined lower helper unexpectedly produced cleanup entries"
+                );
+                body
+            };
+
+            uwriteln!(
+                self.ffi,
+                "\n#doc(hidden)\nfn {name}(ptr : Int, value : {value_ty}) -> Unit {{\n{body}\n}}\n"
+            );
         }
     }
 
@@ -705,6 +843,19 @@ impl InterfaceGenerator<'_> {
         );
 
         let endpoint_plan = self.export_async_function_plan(self.interface, func);
+
+        // Register shared lower-to-memory helpers for the named aggregate
+        // types reached from this export's result so that the recursive lower
+        // is outlined into per-type helpers instead of being inlined into the
+        // `wasmExport*` glue. Only memory-lowered results (return-pointer
+        // results) go through `write_to_memory`, so helpers are only needed
+        // there.
+        if sig.retptr {
+            if let Some(result) = &func.result {
+                self.register_lower_helpers(result);
+            }
+        }
+
         let mut bindgen = FunctionBindgen::new(
             self,
             (0..sig.params.len()).map(|i| format!("p{i}")).collect(),
@@ -2381,6 +2532,19 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                  Bindgen::lift_helper_name, which this generator does not"
             ),
 
+            Instruction::LowerNamedToMemory { ty, offset } => {
+                let name = self
+                    .lower_helper_name(self.interface_gen.resolve, *ty)
+                    .expect("lower helper must be registered before it is emitted");
+                uwriteln!(
+                    self.src,
+                    "{name}(({}) + {offset}, {})",
+                    operands[1],
+                    operands[0],
+                    offset = offset.size_wasm32()
+                )
+            }
+
             Instruction::I32Load8U { offset } => {
                 self.use_ffi(ffi::LOAD8_U);
                 results.push(format!(
@@ -2904,6 +3068,10 @@ impl Bindgen for FunctionBindgen<'_, '_> {
             element,
             Type::U8 | Type::U32 | Type::U64 | Type::S32 | Type::S64 | Type::F32 | Type::F64
         )
+    }
+
+    fn lower_helper_name(&self, _resolve: &Resolve, id: TypeId) -> Option<String> {
+        self.interface_gen.lower_helpers.get(&id).cloned()
     }
 }
 

@@ -3575,6 +3575,10 @@ impl<'a, 'b> Bindgen for FunctionBindgen<'a, 'b> {
                 "LiftNamedFromMemory is only emitted by generators that implement \
                  Bindgen::lift_helper_name, which this generator does not"
             ),
+            abi::Instruction::LowerNamedToMemory { .. } => unreachable!(
+                "LowerNamedToMemory is only emitted by generators that implement \
+                 Bindgen::lower_helper_name, which this generator does not"
+            ),
             abi::Instruction::PointerStore { offset } => {
                 let ptr_type = self.r#gen.r#gen.opts.ptr_type();
                 self.store(ptr_type, *offset, operands)

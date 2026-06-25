@@ -1208,6 +1208,11 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                 results.push(format!("result{tmp}"));
             }
 
+            Instruction::LowerNamedToMemory { .. } => unreachable!(
+                "LowerNamedToMemory is only emitted by generators that implement \
+                 Bindgen::lower_helper_name, which this generator does not"
+            ),
+
             Instruction::I32Store { offset } => {
                 self.push_str(&format!(
                     "*{}.add({}).cast::<i32>() = {};\n",
