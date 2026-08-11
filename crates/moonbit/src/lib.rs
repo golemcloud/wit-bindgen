@@ -2,7 +2,7 @@ use anyhow::Result;
 use core::panic;
 use heck::{ToShoutySnakeCase, ToUpperCamelCase};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt::Write,
     mem,
     ops::Deref,
@@ -102,7 +102,7 @@ impl Opts {
 struct InterfaceFragment {
     src: String,
     ffi: String,
-    builtins: HashSet<&'static str>,
+    builtins: BTreeSet<&'static str>,
 }
 
 impl InterfaceFragment {
@@ -154,7 +154,7 @@ pub struct MoonBit {
     // dependencies between packages
     pkg_resolver: PkgResolver,
     // Wasm export name -> (exported function name, func)
-    export: HashMap<String, (String, String)>,
+    export: BTreeMap<String, (String, String)>,
 
     export_ns: Ns,
 
@@ -185,7 +185,7 @@ impl MoonBit {
             resolve,
             name,
             direction,
-            ffi_imports: HashSet::new(),
+            ffi_imports: BTreeSet::new(),
             derive_opts,
             interface,
             lower_helpers: BTreeMap::new(),
@@ -446,7 +446,7 @@ impl WorldGenerator for MoonBit {
         files.push(&format!("{directory}/import.mbt"), indent(&src).as_bytes());
         // FFI
         let mut ffi = Source::default();
-        let mut builtins: HashSet<&'static str> = HashSet::new();
+        let mut builtins: BTreeSet<&'static str> = BTreeSet::new();
         wit_bindgen_core::generated_preamble(&mut ffi, VERSION);
         uwriteln!(ffi, "{}", self.import_world_fragment.ffi);
         builtins.extend(self.import_world_fragment.builtins.iter());
@@ -645,7 +645,7 @@ struct InterfaceGenerator<'a> {
     src: String,
     ffi: String,
     // Collect of FFI imports used in this interface
-    ffi_imports: HashSet<&'static str>,
+    ffi_imports: BTreeSet<&'static str>,
 
     world_gen: &'a mut MoonBit,
     resolve: &'a Resolve,
@@ -3403,6 +3403,51 @@ mod tests {
                 std::panic!("missing generated file `{path}`; generated: {names}")
             });
         std::str::from_utf8(contents).unwrap()
+    }
+
+    fn snapshot(files: &Files) -> Vec<(String, Vec<u8>)> {
+        files
+            .iter()
+            .map(|(name, contents)| (name.to_string(), contents.to_vec()))
+            .collect()
+    }
+
+    #[test]
+    fn generation_is_deterministic() {
+        let wit = r#"
+            package a:b;
+
+            interface api {
+                strings: func(value: string) -> string;
+                bytes: func(value: list<u8>) -> list<u8>;
+                unsigned-32s: func(value: list<u32>) -> list<u32>;
+                unsigned-64s: func(value: list<u64>) -> list<u64>;
+                signed-32s: func(value: list<s32>) -> list<s32>;
+                signed-64s: func(value: list<s64>) -> list<s64>;
+                floats: func(value: list<f32>) -> list<f32>;
+                doubles: func(value: list<f64>) -> list<f64>;
+            }
+
+            world runner {
+                import api;
+                export api;
+            }
+        "#;
+        let expected = snapshot(&generate(wit, "runner"));
+
+        for iteration in 0..16 {
+            let actual = snapshot(&generate(wit, "runner"));
+            assert_eq!(actual.len(), expected.len());
+            for ((actual_name, actual_contents), (expected_name, expected_contents)) in
+                actual.iter().zip(&expected)
+            {
+                assert_eq!(actual_name, expected_name);
+                assert!(
+                    actual_contents == expected_contents,
+                    "generated file `{actual_name}` changed on iteration {iteration}"
+                );
+            }
+        }
     }
 
     #[test]
