@@ -122,6 +122,30 @@ def_instruction! {
         /// Like `I32Load` or `I64Load`, but for loading array length values.
         LengthLoad { offset: ArchitectureSize } : [1] => [1],
 
+        /// Pops a base pointer from the stack, calls a pre-generated, shared
+        /// per-type lift helper function to read and lift the named aggregate
+        /// type `ty` stored at the constant `offset` from that pointer, and
+        /// pushes the lifted value.
+        ///
+        /// This is used to "outline" the canonical-ABI lift of large named
+        /// record/variant types into shared helper functions instead of
+        /// inlining the full recursive lift at every use site. Keeping each
+        /// generated function small avoids the super-linear native-compile cost
+        /// of a single huge function.
+        LiftNamedFromMemory { ty: TypeId, offset: ArchitectureSize } : [1] => [1],
+
+        /// Pops a value to lower and then a base pointer from the stack, calls a
+        /// pre-generated, shared per-type lower helper function to write the
+        /// named aggregate type `ty` at the constant `offset` from that
+        /// pointer, producing no result.
+        ///
+        /// This is the lower-side counterpart of `LiftNamedFromMemory`: it
+        /// outlines the canonical-ABI "write to memory" of large named
+        /// record/variant types into shared helper functions instead of
+        /// inlining the full recursive lower at every use site. The value
+        /// operand is `operands[0]` and the base pointer is `operands[1]`.
+        LowerNamedToMemory { ty: TypeId, offset: ArchitectureSize } : [2] => [0],
+
         /// Pops a pointer from the stack and then an `i32` value.
         /// Stores the value in little-endian at the pointer specified plus the
         /// constant `offset`.
@@ -791,6 +815,32 @@ pub trait Bindgen {
     /// "canonical" form for lists. This dictates whether the `ListCanonLower`
     /// and `ListCanonLift` instructions are used or not.
     fn is_list_canonical(&self, resolve: &Resolve, element: &Type) -> bool;
+
+    /// Returns the name of a pre-generated, shared lift helper function for the
+    /// named aggregate type `id`, if one exists.
+    ///
+    /// When this returns `Some`, the canonical-ABI lift of that type (in
+    /// `read_from_memory`) is "outlined" into a call to the named helper
+    /// (emitted as `Instruction::LiftNamedFromMemory`) instead of being inlined
+    /// recursively. Generators that do not implement helper outlining should
+    /// return `None` (the default).
+    fn lift_helper_name(&self, resolve: &Resolve, id: TypeId) -> Option<String> {
+        let _ = (resolve, id);
+        None
+    }
+
+    /// Returns the name of a pre-generated, shared lower helper function for
+    /// the named aggregate type `id`, if one exists.
+    ///
+    /// When this returns `Some`, the canonical-ABI lower of that type (in
+    /// `write_to_memory`) is "outlined" into a call to the named helper
+    /// (emitted as `Instruction::LowerNamedToMemory`) instead of being inlined
+    /// recursively. Generators that do not implement helper outlining should
+    /// return `None` (the default).
+    fn lower_helper_name(&self, resolve: &Resolve, id: TypeId) -> Option<String> {
+        let _ = (resolve, id);
+        None
+    }
 }
 
 /// Generates an abstract sequence of instructions which represents this
@@ -858,6 +908,67 @@ pub fn lift_from_memory<B: Bindgen>(
     let mut generator = Generator::new(resolve, bindgen);
     generator.read_from_memory(ty, address, Default::default());
     generator.stack.pop().unwrap()
+}
+
+/// Like [`lift_from_memory`], but used to generate the *body* of an outlined
+/// lift helper for the named type `skip_outline_root`.
+///
+/// The root type itself is lifted inline (one level deep) while nested named
+/// aggregate types are outlined into calls to their own shared helpers (see
+/// [`Bindgen::lift_helper_name`] and [`Instruction::LiftNamedFromMemory`]).
+///
+/// `skip_outline_root` must be the id of the named aggregate (record/variant)
+/// being lifted, and `ty` must be exactly `Type::Id(skip_outline_root)` (not an
+/// alias to it) so that the single-shot inline of the root in `read_from_memory`
+/// lands on the intended type.
+pub fn lift_from_memory_root<B: Bindgen>(
+    resolve: &Resolve,
+    bindgen: &mut B,
+    address: B::Operand,
+    ty: &Type,
+    skip_outline_root: TypeId,
+) -> B::Operand {
+    assert!(
+        matches!(ty, Type::Id(id) if *id == skip_outline_root),
+        "lift_from_memory_root requires `ty` to be `Type::Id(skip_outline_root)`, \
+         not an alias or other type"
+    );
+    let mut generator = Generator::new(resolve, bindgen);
+    generator.lift_outline_root = Some(skip_outline_root);
+    generator.read_from_memory(ty, address, Default::default());
+    generator.stack.pop().unwrap()
+}
+
+/// Like [`lower_to_memory`], but used to generate the *body* of an outlined
+/// lower helper for the named type `skip_outline_root`.
+///
+/// The root type itself is lowered inline (one level deep) while nested named
+/// aggregate types are outlined into calls to their own shared helpers (see
+/// [`Bindgen::lower_helper_name`] and [`Instruction::LowerNamedToMemory`]).
+///
+/// `skip_outline_root` must be the id of the named aggregate (record/variant)
+/// being lowered, and `ty` must be exactly `Type::Id(skip_outline_root)` (not
+/// an alias to it) so that the single-shot inline of the root in
+/// `write_to_memory` lands on the intended type.
+pub fn lower_to_memory_root<B: Bindgen>(
+    resolve: &Resolve,
+    bindgen: &mut B,
+    address: B::Operand,
+    value: B::Operand,
+    ty: &Type,
+    skip_outline_root: TypeId,
+) {
+    assert!(
+        matches!(ty, Type::Id(id) if *id == skip_outline_root),
+        "lower_to_memory_root requires `ty` to be `Type::Id(skip_outline_root)`, \
+         not an alias or other type"
+    );
+    let mut generator = Generator::new(resolve, bindgen);
+    generator.realloc = Some(Realloc::Export("cabi_realloc"));
+    generator.lower_outline_root = Some(skip_outline_root);
+    generator.stack.push(value);
+    generator.write_to_memory(ty, address, Default::default());
+    debug_assert!(generator.stack.is_empty());
 }
 
 /// Used in a similar manner as the `Interface::call` function except is
@@ -1001,6 +1112,16 @@ struct Generator<'a, B: Bindgen> {
     stack: Vec<B::Operand>,
     return_pointer: Option<B::Operand>,
     realloc: Option<Realloc>,
+    /// When generating the body of an outlined lift helper for a named type,
+    /// this holds that type's id so its *own* top-level lift is inlined (one
+    /// level) while nested named aggregates are still outlined into their own
+    /// helpers. `None` everywhere else (so all eligible named types outline).
+    lift_outline_root: Option<TypeId>,
+    /// Like `lift_outline_root`, but for the lower side: when generating the
+    /// body of an outlined lower helper for a named type, this holds that
+    /// type's id so its own top-level lower is inlined (one level) while
+    /// nested named aggregates are still outlined. `None` everywhere else.
+    lower_outline_root: Option<TypeId>,
 }
 
 const MAX_FLAT_PARAMS: usize = 16;
@@ -1016,6 +1137,8 @@ impl<'a, B: Bindgen> Generator<'a, B> {
             stack: Vec::new(),
             return_pointer: None,
             realloc: None,
+            lift_outline_root: None,
+            lower_outline_root: None,
         }
     }
 
@@ -1969,121 +2092,140 @@ impl<'a, B: Bindgen> Generator<'a, B> {
             Type::String => self.write_list_to_memory(ty, addr, offset),
             Type::ErrorContext => self.lower_and_emit(ty, addr, &I32Store { offset }),
 
-            Type::Id(id) => match &self.resolve.types[id].kind {
-                TypeDefKind::Type(t) => self.write_to_memory(t, addr, offset),
-                TypeDefKind::List(_) => self.write_list_to_memory(ty, addr, offset),
-                // Maps have the same linear memory layout as list<tuple<K, V>>.
-                TypeDefKind::Map(_, _) => self.write_list_to_memory(ty, addr, offset),
+            Type::Id(id) => {
+                // Outline the lower of large named aggregate types into shared
+                // helper functions instead of inlining the full recursive
+                // lower here. `lower_outline_root` is `Some(id)` only while
+                // generating that type's own helper body, in which case its
+                // top level is inlined (one level) and nested types still
+                // outline.
+                let is_outline_root = self.lower_outline_root == Some(id);
+                self.lower_outline_root = None;
+                if !is_outline_root && self.bindgen.lower_helper_name(self.resolve, id).is_some() {
+                    self.stack.push(addr);
+                    self.emit(&Instruction::LowerNamedToMemory { ty: id, offset });
+                    return;
+                }
+                match &self.resolve.types[id].kind {
+                    TypeDefKind::Type(t) => self.write_to_memory(t, addr, offset),
+                    TypeDefKind::List(_) => self.write_list_to_memory(ty, addr, offset),
+                    // Maps have the same linear memory layout as list<tuple<K, V>>.
+                    TypeDefKind::Map(_, _) => self.write_list_to_memory(ty, addr, offset),
 
-                TypeDefKind::Future(_) | TypeDefKind::Stream(_) | TypeDefKind::Handle(_) => {
-                    self.lower_and_emit(ty, addr, &I32Store { offset })
-                }
+                    TypeDefKind::Future(_) | TypeDefKind::Stream(_) | TypeDefKind::Handle(_) => {
+                        self.lower_and_emit(ty, addr, &I32Store { offset })
+                    }
 
-                // Decompose the record into its components and then write all
-                // the components into memory one-by-one.
-                TypeDefKind::Record(record) => {
-                    self.emit(&RecordLower {
-                        record,
-                        ty: id,
-                        name: self.resolve.types[id].name.as_deref().unwrap(),
-                    });
-                    self.write_fields_to_memory(record.fields.iter().map(|f| &f.ty), addr, offset);
-                }
-                TypeDefKind::Resource => {
-                    todo!()
-                }
-                TypeDefKind::Tuple(tuple) => {
-                    self.emit(&TupleLower { tuple, ty: id });
-                    self.write_fields_to_memory(tuple.types.iter(), addr, offset);
-                }
+                    // Decompose the record into its components and then write all
+                    // the components into memory one-by-one.
+                    TypeDefKind::Record(record) => {
+                        self.emit(&RecordLower {
+                            record,
+                            ty: id,
+                            name: self.resolve.types[id].name.as_deref().unwrap(),
+                        });
+                        self.write_fields_to_memory(
+                            record.fields.iter().map(|f| &f.ty),
+                            addr,
+                            offset,
+                        );
+                    }
+                    TypeDefKind::Resource => {
+                        todo!()
+                    }
+                    TypeDefKind::Tuple(tuple) => {
+                        self.emit(&TupleLower { tuple, ty: id });
+                        self.write_fields_to_memory(tuple.types.iter(), addr, offset);
+                    }
 
-                TypeDefKind::Flags(f) => {
-                    self.lower(ty);
-                    match f.repr() {
-                        FlagsRepr::U8 => {
-                            self.stack.push(addr);
-                            self.store_intrepr(offset, Int::U8);
-                        }
-                        FlagsRepr::U16 => {
-                            self.stack.push(addr);
-                            self.store_intrepr(offset, Int::U16);
-                        }
-                        FlagsRepr::U32(n) => {
-                            for i in (0..n).rev() {
-                                self.stack.push(addr.clone());
-                                self.emit(&I32Store {
-                                    offset: offset.add_bytes(i * 4),
-                                });
+                    TypeDefKind::Flags(f) => {
+                        self.lower(ty);
+                        match f.repr() {
+                            FlagsRepr::U8 => {
+                                self.stack.push(addr);
+                                self.store_intrepr(offset, Int::U8);
+                            }
+                            FlagsRepr::U16 => {
+                                self.stack.push(addr);
+                                self.store_intrepr(offset, Int::U16);
+                            }
+                            FlagsRepr::U32(n) => {
+                                for i in (0..n).rev() {
+                                    self.stack.push(addr.clone());
+                                    self.emit(&I32Store {
+                                        offset: offset.add_bytes(i * 4),
+                                    });
+                                }
                             }
                         }
                     }
-                }
 
-                // Each case will get its own block, and the first item in each
-                // case is writing the discriminant. After that if we have a
-                // payload we write the payload after the discriminant, aligned up
-                // to the type's alignment.
-                TypeDefKind::Variant(v) => {
-                    self.write_variant_arms_to_memory(
-                        offset,
-                        addr,
-                        v.tag(),
-                        v.cases.iter().map(|c| c.ty.as_ref()),
-                    );
-                    self.emit(&VariantLower {
-                        variant: v,
-                        ty: id,
-                        results: &[],
-                        name: self.resolve.types[id].name.as_deref().unwrap(),
-                    });
-                }
+                    // Each case will get its own block, and the first item in each
+                    // case is writing the discriminant. After that if we have a
+                    // payload we write the payload after the discriminant, aligned up
+                    // to the type's alignment.
+                    TypeDefKind::Variant(v) => {
+                        self.write_variant_arms_to_memory(
+                            offset,
+                            addr,
+                            v.tag(),
+                            v.cases.iter().map(|c| c.ty.as_ref()),
+                        );
+                        self.emit(&VariantLower {
+                            variant: v,
+                            ty: id,
+                            results: &[],
+                            name: self.resolve.types[id].name.as_deref().unwrap(),
+                        });
+                    }
 
-                TypeDefKind::Option(t) => {
-                    self.write_variant_arms_to_memory(offset, addr, Int::U8, [None, Some(t)]);
-                    self.emit(&OptionLower {
-                        payload: t,
-                        ty: id,
-                        results: &[],
-                    });
-                }
+                    TypeDefKind::Option(t) => {
+                        self.write_variant_arms_to_memory(offset, addr, Int::U8, [None, Some(t)]);
+                        self.emit(&OptionLower {
+                            payload: t,
+                            ty: id,
+                            results: &[],
+                        });
+                    }
 
-                TypeDefKind::Result(r) => {
-                    self.write_variant_arms_to_memory(
-                        offset,
-                        addr,
-                        Int::U8,
-                        [r.ok.as_ref(), r.err.as_ref()],
-                    );
-                    self.emit(&ResultLower {
-                        result: r,
-                        ty: id,
-                        results: &[],
-                    });
-                }
+                    TypeDefKind::Result(r) => {
+                        self.write_variant_arms_to_memory(
+                            offset,
+                            addr,
+                            Int::U8,
+                            [r.ok.as_ref(), r.err.as_ref()],
+                        );
+                        self.emit(&ResultLower {
+                            result: r,
+                            ty: id,
+                            results: &[],
+                        });
+                    }
 
-                TypeDefKind::Enum(e) => {
-                    self.lower(ty);
-                    self.stack.push(addr);
-                    self.store_intrepr(offset, e.tag());
-                }
+                    TypeDefKind::Enum(e) => {
+                        self.lower(ty);
+                        self.stack.push(addr);
+                        self.store_intrepr(offset, e.tag());
+                    }
 
-                TypeDefKind::Unknown => unreachable!(),
-                TypeDefKind::FixedLengthList(element, size) => {
-                    // resembles write_list_to_memory
-                    self.push_block();
-                    self.emit(&IterElem { element });
-                    self.emit(&IterBasePointer);
-                    let elem_addr = self.stack.pop().unwrap();
-                    self.write_to_memory(element, elem_addr, offset);
-                    self.finish_block(0);
-                    self.stack.push(addr);
-                    self.emit(&FixedLengthListLowerToMemory {
-                        element,
-                        size: *size,
-                        id,
-                    });
+                    TypeDefKind::Unknown => unreachable!(),
+                    TypeDefKind::FixedLengthList(element, size) => {
+                        // resembles write_list_to_memory
+                        self.push_block();
+                        self.emit(&IterElem { element });
+                        self.emit(&IterBasePointer);
+                        let elem_addr = self.stack.pop().unwrap();
+                        self.write_to_memory(element, elem_addr, offset);
+                        self.finish_block(0);
+                        self.stack.push(addr);
+                        self.emit(&FixedLengthListLowerToMemory {
+                            element,
+                            size: *size,
+                            id,
+                        });
+                    }
                 }
-            },
+            }
         }
     }
 
@@ -2177,114 +2319,132 @@ impl<'a, B: Bindgen> Generator<'a, B> {
             Type::String => self.read_list_from_memory(ty, addr, offset),
             Type::ErrorContext => self.emit_and_lift(ty, addr, &I32Load { offset }),
 
-            Type::Id(id) => match &self.resolve.types[id].kind {
-                TypeDefKind::Type(t) => self.read_from_memory(t, addr, offset),
-
-                TypeDefKind::List(_) => self.read_list_from_memory(ty, addr, offset),
-                // Maps have the same linear memory layout as list<tuple<K, V>>.
-                TypeDefKind::Map(_, _) => self.read_list_from_memory(ty, addr, offset),
-
-                TypeDefKind::Future(_) | TypeDefKind::Stream(_) | TypeDefKind::Handle(_) => {
-                    self.emit_and_lift(ty, addr, &I32Load { offset })
+            Type::Id(id) => {
+                // Outline the lift of large named aggregate types into shared
+                // helper functions instead of inlining the full recursive lift
+                // here. `lift_outline_root` is `Some(id)` only while generating
+                // that type's own helper body, in which case its top level is
+                // inlined (one level) and nested types still outline.
+                let is_outline_root = self.lift_outline_root == Some(id);
+                self.lift_outline_root = None;
+                if !is_outline_root && self.bindgen.lift_helper_name(self.resolve, id).is_some() {
+                    self.stack.push(addr);
+                    self.emit(&Instruction::LiftNamedFromMemory { ty: id, offset });
+                    return;
                 }
+                match &self.resolve.types[id].kind {
+                    TypeDefKind::Type(t) => self.read_from_memory(t, addr, offset),
 
-                TypeDefKind::Resource => {
-                    todo!();
-                }
+                    TypeDefKind::List(_) => self.read_list_from_memory(ty, addr, offset),
+                    // Maps have the same linear memory layout as list<tuple<K, V>>.
+                    TypeDefKind::Map(_, _) => self.read_list_from_memory(ty, addr, offset),
 
-                // Read and lift each field individually, adjusting the offset
-                // as we go along, then aggregate all the fields into the
-                // record.
-                TypeDefKind::Record(record) => {
-                    self.read_fields_from_memory(record.fields.iter().map(|f| &f.ty), addr, offset);
-                    self.emit(&RecordLift {
-                        record,
-                        ty: id,
-                        name: self.resolve.types[id].name.as_deref().unwrap(),
-                    });
-                }
+                    TypeDefKind::Future(_) | TypeDefKind::Stream(_) | TypeDefKind::Handle(_) => {
+                        self.emit_and_lift(ty, addr, &I32Load { offset })
+                    }
 
-                TypeDefKind::Tuple(tuple) => {
-                    self.read_fields_from_memory(&tuple.types, addr, offset);
-                    self.emit(&TupleLift { tuple, ty: id });
-                }
+                    TypeDefKind::Resource => {
+                        todo!();
+                    }
 
-                TypeDefKind::Flags(f) => {
-                    match f.repr() {
-                        FlagsRepr::U8 => {
-                            self.stack.push(addr);
-                            self.load_intrepr(offset, Int::U8);
-                        }
-                        FlagsRepr::U16 => {
-                            self.stack.push(addr);
-                            self.load_intrepr(offset, Int::U16);
-                        }
-                        FlagsRepr::U32(n) => {
-                            for i in 0..n {
-                                self.stack.push(addr.clone());
-                                self.emit(&I32Load {
-                                    offset: offset.add_bytes(i * 4),
-                                });
+                    // Read and lift each field individually, adjusting the offset
+                    // as we go along, then aggregate all the fields into the
+                    // record.
+                    TypeDefKind::Record(record) => {
+                        self.read_fields_from_memory(
+                            record.fields.iter().map(|f| &f.ty),
+                            addr,
+                            offset,
+                        );
+                        self.emit(&RecordLift {
+                            record,
+                            ty: id,
+                            name: self.resolve.types[id].name.as_deref().unwrap(),
+                        });
+                    }
+
+                    TypeDefKind::Tuple(tuple) => {
+                        self.read_fields_from_memory(&tuple.types, addr, offset);
+                        self.emit(&TupleLift { tuple, ty: id });
+                    }
+
+                    TypeDefKind::Flags(f) => {
+                        match f.repr() {
+                            FlagsRepr::U8 => {
+                                self.stack.push(addr);
+                                self.load_intrepr(offset, Int::U8);
+                            }
+                            FlagsRepr::U16 => {
+                                self.stack.push(addr);
+                                self.load_intrepr(offset, Int::U16);
+                            }
+                            FlagsRepr::U32(n) => {
+                                for i in 0..n {
+                                    self.stack.push(addr.clone());
+                                    self.emit(&I32Load {
+                                        offset: offset.add_bytes(i * 4),
+                                    });
+                                }
                             }
                         }
+                        self.lift(ty);
                     }
-                    self.lift(ty);
-                }
 
-                // Each case will get its own block, and we'll dispatch to the
-                // right block based on the `i32.load` we initially perform. Each
-                // individual block is pretty simple and just reads the payload type
-                // from the corresponding offset if one is available.
-                TypeDefKind::Variant(variant) => {
-                    self.read_variant_arms_from_memory(
-                        offset,
-                        addr,
-                        variant.tag(),
-                        variant.cases.iter().map(|c| c.ty.as_ref()),
-                    );
-                    self.emit(&VariantLift {
-                        variant,
-                        ty: id,
-                        name: self.resolve.types[id].name.as_deref().unwrap(),
-                    });
-                }
+                    // Each case will get its own block, and we'll dispatch to the
+                    // right block based on the `i32.load` we initially perform. Each
+                    // individual block is pretty simple and just reads the payload type
+                    // from the corresponding offset if one is available.
+                    TypeDefKind::Variant(variant) => {
+                        self.read_variant_arms_from_memory(
+                            offset,
+                            addr,
+                            variant.tag(),
+                            variant.cases.iter().map(|c| c.ty.as_ref()),
+                        );
+                        self.emit(&VariantLift {
+                            variant,
+                            ty: id,
+                            name: self.resolve.types[id].name.as_deref().unwrap(),
+                        });
+                    }
 
-                TypeDefKind::Option(t) => {
-                    self.read_variant_arms_from_memory(offset, addr, Int::U8, [None, Some(t)]);
-                    self.emit(&OptionLift { payload: t, ty: id });
-                }
+                    TypeDefKind::Option(t) => {
+                        self.read_variant_arms_from_memory(offset, addr, Int::U8, [None, Some(t)]);
+                        self.emit(&OptionLift { payload: t, ty: id });
+                    }
 
-                TypeDefKind::Result(r) => {
-                    self.read_variant_arms_from_memory(
-                        offset,
-                        addr,
-                        Int::U8,
-                        [r.ok.as_ref(), r.err.as_ref()],
-                    );
-                    self.emit(&ResultLift { result: r, ty: id });
-                }
+                    TypeDefKind::Result(r) => {
+                        self.read_variant_arms_from_memory(
+                            offset,
+                            addr,
+                            Int::U8,
+                            [r.ok.as_ref(), r.err.as_ref()],
+                        );
+                        self.emit(&ResultLift { result: r, ty: id });
+                    }
 
-                TypeDefKind::Enum(e) => {
-                    self.stack.push(addr.clone());
-                    self.load_intrepr(offset, e.tag());
-                    self.lift(ty);
-                }
+                    TypeDefKind::Enum(e) => {
+                        self.stack.push(addr.clone());
+                        self.load_intrepr(offset, e.tag());
+                        self.lift(ty);
+                    }
 
-                TypeDefKind::Unknown => unreachable!(),
-                TypeDefKind::FixedLengthList(ty, size) => {
-                    self.push_block();
-                    self.emit(&IterBasePointer);
-                    let elemaddr = self.stack.pop().unwrap();
-                    self.read_from_memory(ty, elemaddr, offset);
-                    self.finish_block(1);
-                    self.stack.push(addr.clone());
-                    self.emit(&FixedLengthListLiftFromMemory {
-                        element: ty,
-                        size: *size,
-                        id,
-                    });
+                    TypeDefKind::Unknown => unreachable!(),
+                    TypeDefKind::FixedLengthList(ty, size) => {
+                        self.push_block();
+                        self.emit(&IterBasePointer);
+                        let elemaddr = self.stack.pop().unwrap();
+                        self.read_from_memory(ty, elemaddr, offset);
+                        self.finish_block(1);
+                        self.stack.push(addr.clone());
+                        self.emit(&FixedLengthListLiftFromMemory {
+                            element: ty,
+                            size: *size,
+                            id,
+                        });
+                    }
                 }
-            },
+            }
         }
     }
 

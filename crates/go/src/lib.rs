@@ -45,7 +45,7 @@ fn remote_pkg(name: &str) -> String {
 }
 
 /// The version of github.com/bytecodealliance/go-pkg that's being used
-const REMOTE_PKG_VERSION: &str = "v0.2.1";
+const REMOTE_PKG_VERSION: &str = "v0.2.2";
 
 /// If a user specifies the `pkg_name` flag, the required version for the
 /// shared remote package isn't recorded. This enables downstream users to retrieve the version programmatically.
@@ -221,7 +221,8 @@ struct Go {
     interface_names: HashMap<InterfaceId, WorldKey>,
     interfaces: BTreeMap<String, InterfaceData>,
     export_interfaces: BTreeMap<String, InterfaceData>,
-    types: HashSet<TypeId>,
+    // Add String to the types to allow for implements of the same type in different interfaces to be generated.
+    types: HashSet<(String, TypeId)>,
     resources: HashMap<TypeId, Direction>,
     futures_and_streams: HashMap<(TypeId, bool), Option<WorldKey>>,
 }
@@ -251,7 +252,7 @@ impl Go {
         if local == owner && (exported ^ in_import) {
             String::new()
         } else {
-            let package = self.interface_name(resolve, owner);
+            let package = self.go_package_name(resolve, owner);
             let package = if exported {
                 format!("export_{package}")
             } else {
@@ -637,7 +638,7 @@ func Lift{upper_kind}{camel}(handle int32) *witTypes.{upper_kind}Reader[{payload
                                 } else {
                                     format!(
                                         "{}_",
-                                        self.interface_name(
+                                        self.go_package_name(
                                             resolve,
                                             Some(
                                                 &self
@@ -724,10 +725,11 @@ impl WorldGenerator for Go {
         false
     }
 
-    fn preprocess(&mut self, resolve: &Resolve, world: WorldId) {
+    fn preprocess(&mut self, resolve: &Resolve, world: WorldId) -> Result<()> {
         _ = world;
         self.sizes.fill(resolve);
         self.imports.insert(remote_pkg("runtime"));
+        Ok(())
     }
 
     fn import_interface(
@@ -737,15 +739,17 @@ impl WorldGenerator for Go {
         id: InterfaceId,
         _files: &mut Files,
     ) -> Result<()> {
-        if let WorldKey::Name(_) = name {
-            self.interface_names.insert(id, name.clone());
-        }
+        self.interface_names.insert(id, name.clone());
 
+        let go_package_name = self.go_package_name(resolve, Some(name));
         let mut data = {
             let mut generator = InterfaceGenerator::new(self, resolve, Some((id, name)), true);
             for (name, ty) in resolve.interfaces[id].types.iter() {
-                if !generator.generator.types.contains(ty) {
-                    generator.generator.types.insert(*ty);
+                if generator
+                    .generator
+                    .types
+                    .insert((go_package_name.clone(), *ty))
+                {
                     generator.define_type(name, *ty);
                 }
             }
@@ -756,7 +760,7 @@ impl WorldGenerator for Go {
             data.extend(self.import(resolve, func, Some(name)));
         }
         self.interfaces
-            .entry(self.interface_name(resolve, Some(name)))
+            .entry(go_package_name)
             .or_default()
             .extend(data);
 
@@ -775,7 +779,7 @@ impl WorldGenerator for Go {
             data.extend(self.import(resolve, func, None));
         }
         self.interfaces
-            .entry(self.interface_name(resolve, None))
+            .entry(self.go_package_name(resolve, None))
             .or_default()
             .extend(data);
     }
@@ -787,30 +791,32 @@ impl WorldGenerator for Go {
         id: InterfaceId,
         _files: &mut Files,
     ) -> Result<()> {
-        if let WorldKey::Name(_) = name {
-            self.interface_names.insert(id, name.clone());
-        }
+        self.interface_names.insert(id, name.clone());
 
+        let go_package_name = self.go_package_name(resolve, Some(name));
         for (type_name, ty) in &resolve.interfaces[id].types {
             let exported = matches!(resolve.types[*ty].kind, TypeDefKind::Resource)
                 || self.has_exported_resource(resolve, Type::Id(*ty));
 
             let mut generator = InterfaceGenerator::new(self, resolve, Some((id, name)), false);
 
-            if exported || !generator.generator.types.contains(ty) {
-                generator.generator.types.insert(*ty);
+            if generator
+                .generator
+                .types
+                .insert((go_package_name.clone(), *ty))
+                || exported
+            {
                 generator.define_type(type_name, *ty);
             }
 
             let data = generator.into();
 
-            let name = self.interface_name(resolve, Some(name));
             if exported {
                 &mut self.export_interfaces
             } else {
                 &mut self.interfaces
             }
-            .entry(name)
+            .entry(go_package_name.clone())
             .or_default()
             .extend(data);
         }
@@ -844,18 +850,15 @@ impl WorldGenerator for Go {
         types: &[(&str, TypeId)],
         _files: &mut Files,
     ) {
+        let package = self.go_package_name(resolve, None);
         let mut generator = InterfaceGenerator::new(self, resolve, None, true);
         for (name, ty) in types {
-            if !generator.generator.types.contains(ty) {
-                generator.generator.types.insert(*ty);
+            if generator.generator.types.insert((package.clone(), *ty)) {
                 generator.define_type(name, *ty);
             }
         }
         let data = generator.into();
-        self.interfaces
-            .entry(self.interface_name(resolve, None))
-            .or_default()
-            .extend(data);
+        self.interfaces.entry(package).or_default().extend(data);
     }
 
     fn finish(&mut self, resolve: &Resolve, id: WorldId, files: &mut Files) -> Result<()> {
@@ -1376,7 +1379,7 @@ func wasm_export_post_return_{name}(result {results}) {{
             let results = self.func_results(resolve, func, interface, false, &mut imports);
 
             self.export_interfaces
-                .entry(self.interface_name(resolve, interface))
+                .entry(self.go_package_name(resolve, interface))
                 .or_default()
                 .extend(InterfaceData {
                     code: format!(
@@ -1495,7 +1498,7 @@ func wasm_export_{name}({params}) {results} {{
                     &func.name,
                 );
 
-                let name = self.interface_name(resolve, interface);
+                let name = self.go_package_name(resolve, interface);
                 if in_import || !exported {
                     &mut self.interfaces
                 } else {
@@ -1521,7 +1524,7 @@ func wasm_export_{name}({params}) {results} {{
         })
     }
 
-    fn interface_name(&self, resolve: &Resolve, interface: Option<&WorldKey>) -> String {
+    fn go_package_name(&self, resolve: &Resolve, interface: Option<&WorldKey>) -> String {
         match interface {
             Some(WorldKey::Name(name)) => name.to_snake_case(),
             Some(WorldKey::Interface(id)) => {
@@ -1556,7 +1559,7 @@ func wasm_export_{name}({params}) {results} {{
         interface: Option<&WorldKey>,
         func: &Function,
     ) -> String {
-        let prefix = self.interface_name(resolve, interface);
+        let prefix = self.go_package_name(resolve, interface);
         let name = func.name.to_snake_case().replace('.', "_");
 
         format!("{prefix}_{name}")
@@ -1852,7 +1855,7 @@ for index := 0; index < int({length}); index++ {{
                 let name = func.item_name().to_upper_camel_case();
                 let package = format!(
                     "export_{}",
-                    self.generator.interface_name(resolve, self.interface)
+                    self.generator.go_package_name(resolve, self.interface)
                 );
 
                 let call = match &func.kind {
@@ -1992,6 +1995,14 @@ return {results}"
             Instruction::LengthLoad { offset } => {
                 load(self, results, &operands[0], offset, "uint32", &|v| v)
             }
+            Instruction::LiftNamedFromMemory { .. } => unreachable!(
+                "LiftNamedFromMemory is only emitted by generators that implement \
+                 Bindgen::lift_helper_name, which this generator does not"
+            ),
+            Instruction::LowerNamedToMemory { .. } => unreachable!(
+                "LowerNamedToMemory is only emitted by generators that implement \
+                 Bindgen::lower_helper_name, which this generator does not"
+            ),
             Instruction::PointerLoad { offset } => {
                 load(self, results, &operands[0], offset, "uint32", &|v| {
                     format!("uintptr({v})")

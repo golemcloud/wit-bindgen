@@ -26,6 +26,14 @@ pub struct InterfaceGenerator<'a> {
     pub return_pointer_area_align: Alignment,
     pub(super) needs_runtime_module: bool,
     pub(super) needs_wit_map: bool,
+    /// Map of named aggregate type -> name of a shared, outlined lift helper
+    /// function generated for that type. Populated for guest imports so the
+    /// canonical-ABI lift of large types is shared across all wrappers in this
+    /// interface instead of being inlined into each one.
+    pub(super) lift_helpers: BTreeMap<TypeId, String>,
+    /// Generated source for the bodies of the helpers in `lift_helpers`,
+    /// flushed into `src` once at the end of import generation.
+    pub(super) lift_helper_bodies: Source,
 }
 
 /// A description of the "mode" in which a type is printed.
@@ -406,8 +414,147 @@ macro_rules! {macro_name} {{
         funcs: impl Iterator<Item = &'a Function>,
         interface: Option<&WorldKey>,
     ) {
+        let funcs: Vec<&Function> = funcs.collect();
+
+        // Register shared lift helpers for the result types of all imported
+        // functions (transitively over all named aggregate types), then emit
+        // their bodies once. Wrappers below then lift via calls to these shared
+        // helpers instead of inlining the full recursive lift each time.
+        //
+        // Only register a helper when the import actually lifts its result from
+        // memory; otherwise the generated helper would be unused:
+        //   * skipped functions emit no wrapper at all, and
+        //   * a synchronous result that fits in flat returns is lifted directly
+        //     (`abi::call` uses `lift`, not `read_from_memory`).
+        // Async imports always deliver their result via memory. Under-registering
+        // is always safe: `read_from_memory` simply inlines the lift when no
+        // helper exists for a type.
+        for func in &funcs {
+            if self.r#gen.skip.contains(&func.name) {
+                continue;
+            }
+            let Some(result) = func.result.as_ref() else {
+                continue;
+            };
+            let async_ = self.r#gen.is_async(self.resolve, interface, func, true);
+            let memory_lifted = async_
+                || self
+                    .resolve
+                    .wasm_signature(AbiVariant::GuestImport, func)
+                    .retptr;
+            if memory_lifted {
+                self.register_lift_helpers(result);
+            }
+        }
+        self.generate_lift_helper_bodies();
+        let bodies = mem::take(&mut self.lift_helper_bodies);
+        self.src.push_str(&String::from(bodies));
+
         for func in funcs {
             self.generate_guest_import(func, interface);
+        }
+    }
+
+    /// Recursively registers a shared lift helper for `ty` and every named
+    /// aggregate type (record/variant) reachable from it. Only registers names
+    /// here; bodies are generated later by `generate_lift_helper_bodies`.
+    fn register_lift_helpers(&mut self, ty: &Type) {
+        let Type::Id(id) = ty else { return };
+        let id = *id;
+        match &self.resolve.types[id].kind {
+            TypeDefKind::Type(t) => {
+                let t = *t;
+                self.register_lift_helpers(&t);
+            }
+            TypeDefKind::Record(_) | TypeDefKind::Variant(_) => {
+                if self.lift_helpers.contains_key(&id) {
+                    return;
+                }
+                let name = format!("__wit_bindgen_lift_t{}", id.index());
+                self.lift_helpers.insert(id, name);
+                // Collect child types first to avoid borrow conflicts.
+                let children: Vec<Type> = match &self.resolve.types[id].kind {
+                    TypeDefKind::Record(r) => r.fields.iter().map(|f| f.ty).collect(),
+                    TypeDefKind::Variant(v) => v.cases.iter().filter_map(|c| c.ty).collect(),
+                    _ => Vec::new(),
+                };
+                for child in children {
+                    self.register_lift_helpers(&child);
+                }
+            }
+            TypeDefKind::List(t) | TypeDefKind::Option(t) | TypeDefKind::FixedLengthList(t, _) => {
+                let t = *t;
+                self.register_lift_helpers(&t);
+            }
+            TypeDefKind::Tuple(tuple) => {
+                let tys: Vec<Type> = tuple.types.clone();
+                for t in tys {
+                    self.register_lift_helpers(&t);
+                }
+            }
+            TypeDefKind::Result(r) => {
+                let ok = r.ok;
+                let err = r.err;
+                if let Some(t) = ok {
+                    self.register_lift_helpers(&t);
+                }
+                if let Some(t) = err {
+                    self.register_lift_helpers(&t);
+                }
+            }
+            TypeDefKind::Map(k, v) => {
+                let k = *k;
+                let v = *v;
+                self.register_lift_helpers(&k);
+                self.register_lift_helpers(&v);
+            }
+            _ => {}
+        }
+    }
+
+    /// Generates the body of every registered lift helper into
+    /// `lift_helper_bodies`.
+    fn generate_lift_helper_bodies(&mut self) {
+        let ids: Vec<TypeId> = self.lift_helpers.keys().copied().collect();
+        let resolve = self.resolve;
+        let module = self.wasm_import_module;
+        for id in ids {
+            let name = self.lift_helpers[&id].clone();
+            let ret_ty = self.type_path(id, true);
+            let ty = Type::Id(id);
+
+            let mut f = FunctionBindgen::new(self, Vec::new(), module, true, false);
+            let expr = abi::lift_from_memory_root(resolve, &mut f, "ptr".to_string(), &ty, id);
+            let body = String::from(mem::take(&mut f.src));
+
+            // A pure memory-lift of a record/variant must not require any of the
+            // side state that `generate_guest_import_body_sync` would otherwise
+            // flush into the surrounding function. These are dropped here, so
+            // assert the assumption holds rather than silently emitting broken
+            // code if a future lift path starts depending on them.
+            assert!(
+                !f.needs_cleanup_list,
+                "outlined lift helper unexpectedly requires a cleanup list"
+            );
+            assert!(
+                f.import_return_pointer_area_size.is_empty(),
+                "outlined lift helper unexpectedly requires a return pointer area"
+            );
+            assert!(
+                f.handle_decls.is_empty(),
+                "outlined lift helper unexpectedly produced handle declarations"
+            );
+
+            uwriteln!(
+                self.lift_helper_bodies,
+                "#[allow(dead_code, unused_unsafe, clippy::all)]\n\
+                 unsafe fn {name}(ptr: *mut u8) -> {ret_ty} {{\n\
+                 unsafe {{\n\
+                 {body}\n\
+                 {expr}\n\
+                 }}\n\
+                 }}"
+            );
         }
     }
 
@@ -652,7 +799,12 @@ macro_rules! {macro_name} {{
         let lower;
         let dealloc_lists;
         if let Some(payload_type) = payload_type {
-            lift = self.lift_from_memory("ptr", &payload_type, &module);
+            // This `lift` snippet is emitted inside a nested `pub mod vtable{N}`
+            // that lives in a separate module tree from the interface's lift
+            // helpers, so outlining (which emits unqualified helper calls) would
+            // not resolve. Lift inline instead; this payload `lift` is already an
+            // isolated single-value function.
+            lift = self.lift_from_memory_no_outline("ptr", &payload_type, &module);
             dealloc_lists = self.deallocate_lists(
                 std::slice::from_ref(payload_type),
                 &["ptr".to_string()],
@@ -848,7 +1000,26 @@ pub mod vtable{ordinal} {{
     }
 
     fn lift_from_memory(&mut self, address: &str, ty: &Type, module: &str) -> String {
+        self.lift_from_memory_inner(address, ty, module, true)
+    }
+
+    /// Like [`Self::lift_from_memory`], but never outlines into shared lift
+    /// helpers. Used for snippets emitted into a nested submodule (e.g. a
+    /// `future`/`stream` payload vtable), where the unqualified helper calls
+    /// would not resolve because the helpers live in a different module.
+    fn lift_from_memory_no_outline(&mut self, address: &str, ty: &Type, module: &str) -> String {
+        self.lift_from_memory_inner(address, ty, module, false)
+    }
+
+    fn lift_from_memory_inner(
+        &mut self,
+        address: &str,
+        ty: &Type,
+        module: &str,
+        outline_lifts: bool,
+    ) -> String {
         let mut f = FunctionBindgen::new(self, Vec::new(), module, true, false);
+        f.outline_lifts = outline_lifts;
         let result = abi::lift_from_memory(f.r#gen.resolve, &mut f, address.into(), ty);
         format!("unsafe {{ {}\n{result} }}", String::from(f.src))
     }
