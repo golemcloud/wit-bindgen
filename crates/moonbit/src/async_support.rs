@@ -1296,7 +1296,7 @@ impl<'a> InterfaceGenerator<'a> {
                 lift_result: String::new(),
                 lower: "ignore((ptr, value))".into(),
                 malloc: "let ptr = 0".into(),
-                lift_list: "FixedArray::make(length, Unit::default())".into(),
+                lift_list: "FixedArray::make(length, Default::default())".into(),
                 commit: String::new(),
                 reject: String::new(),
                 free_outer: "ignore(ptr)".into(),
@@ -1383,6 +1383,7 @@ impl<'a> InterfaceGenerator<'a> {
             .then(|| {
                 format!(
                     r#"
+                    #warnings("-unused_value")
                     fn wasmImport{symbol_name}DropReadable(handle : Int) = "{drop_readable_module}" "{drop_readable_field}"
                     "#
                 )
@@ -1475,7 +1476,7 @@ fn wasm{symbol_name}FutureRejectPrepared(handle : Int) -> Bool {{
                         wasmImport{symbol_name}Write(writer, ptr),
                     )
                 }}
-                guard terminal.val is Some(transferred)
+                guard! terminal.val is Some(transferred)
                 if transferred {{
                     abort("rejected component future unexpectedly transferred a value")
                 }}
@@ -1604,17 +1605,11 @@ async fn Wasm{symbol_name}FutureSource::read(
     self.read_buffer = ptr
     self.read_discarding = false
     self.read_cleanup_done = false
-    {ffi}suspend_for_future_read(
-        self.handle,
-        wasmImport{symbol_name}Read(self.handle, ptr),
-    ) catch {{
-        err => {{
-            if self.read_discarding {{
-                self.wait_for_read_cleanup()
-                self.finish_read()
-                raise {ffi}FutureReadError::Dropped
-            }}
-            if err is {ffi}Cancelled::Cancelled {{
+    let discarded = Ref(false)
+    let read_result = try {{
+        errdefer {{
+            discarded.val = self.read_discarding
+            if {ffi}is_being_cancelled() {{
                 self.cancel_active_read()
                 if !self.closed {{
                     self.closed = true
@@ -1622,8 +1617,19 @@ async fn Wasm{symbol_name}FutureSource::read(
                 }}
             }}
             self.finish_read()
-            raise err
         }}
+        let result = {ffi}suspend_for_future_read(
+            self.handle,
+            wasmImport{symbol_name}Read(self.handle, ptr),
+        )
+        Ok(result)
+    }} catch {{
+        err => Err(err)
+    }}
+    match read_result {{
+        Ok(_) => ()
+        Err(_) if discarded.val => raise {ffi}FutureReadError::Dropped
+        Err(err) => raise err
     }}
     if self.read_discarding {{
         self.wait_for_read_cleanup()
@@ -1639,6 +1645,7 @@ async fn Wasm{symbol_name}FutureSource::read(
     value
 }}
 
+#warnings("-unused_value")
 fn wasm{symbol_name}FutureLift(handle : Int) -> {ffi}Future[{result}] {{
     let source = Wasm{symbol_name}FutureSource::{{
         handle,
@@ -1708,7 +1715,7 @@ fn wasm{symbol_name}FutureCommit(handle : Int) -> Unit {{
                         wasmImport{symbol_name}Write(writer, ptr),
                     )
                 }}
-                guard terminal.val is Some(transferred)
+                guard! terminal.val is Some(transferred)
                 if transferred {{
                     wasm{symbol_name}Commit(ptr, 0, 1)
                 }} else {{
@@ -1918,17 +1925,11 @@ async fn Wasm{symbol_name}StreamSource::read(
     self.read_buffer = ptr
     self.read_discarding = false
     self.read_cleanup_done = false
-    let (progress, end) = {ffi}suspend_for_stream_read(
-        self.handle,
-        wasmImport{symbol_name}Read(self.handle, ptr, read_count),
-    ) catch {{
-        err => {{
-            if self.read_discarding {{
-                self.wait_for_read_cleanup()
-                self.finish_read()
-                return None
-            }}
-            if err is {ffi}Cancelled::Cancelled {{
+    let discarded = Ref(false)
+    let read_result = try {{
+        errdefer {{
+            discarded.val = self.read_discarding
+            if {ffi}is_being_cancelled() {{
                 self.cancel_active_read()
                 if !self.closed {{
                     self.closed = true
@@ -1936,8 +1937,19 @@ async fn Wasm{symbol_name}StreamSource::read(
                 }}
             }}
             self.finish_read()
-            raise err
         }}
+        let result = {ffi}suspend_for_stream_read(
+            self.handle,
+            wasmImport{symbol_name}Read(self.handle, ptr, read_count),
+        )
+        Ok(result)
+    }} catch {{
+        err => Err(err)
+    }}
+    let (progress, end) = match read_result {{
+        Ok(result) => result
+        Err(_) if discarded.val => return None
+        Err(err) => raise err
     }}
     if self.read_discarding {{
         self.wait_for_read_cleanup()
@@ -1961,6 +1973,7 @@ async fn Wasm{symbol_name}StreamSource::read(
     Some(values)
 }}
 
+#warnings("-unused_value")
 fn wasm{symbol_name}StreamLift(handle : Int) -> {ffi}Stream[{result}] {{
     let source = Wasm{symbol_name}StreamSource::{{
         handle,

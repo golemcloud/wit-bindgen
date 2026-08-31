@@ -193,8 +193,8 @@ impl MoonBit {
     }
 
     fn write_moon_pkg(&self, moon_pkg: &mut Source, imports: Option<&Imports>, link: bool) {
-        // Disable warning for invalid inline wasm
-        moon_pkg.push_str("{\n\"warn-list\": \"-44\"");
+        // Inline Wasm and private canonical-ABI helpers are intentional in generated packages.
+        moon_pkg.push_str("{\n\"warn-list\": \"-44-unused_value-declaration_unimplemented\"");
         // Dependencies
         if let Some(imports) = imports {
             moon_pkg.push_str(",\n\"import\": [\n");
@@ -902,6 +902,7 @@ impl InterfaceGenerator<'_> {
         uwrite!(
             self.src,
             r#"
+            #warnings("-declaration_unimplemented")
             declare {func_sig}
             "#
         );
@@ -1191,16 +1192,16 @@ impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
         if self.derive_opts.derive_eq {
             deriviation.push("Eq")
         }
-        let declaration = if self.derive_opts.derive_error && name.contains("Error") {
-            "suberror"
+        let type_definition = if self.derive_opts.derive_error && name.contains("Error") {
+            format!("suberror {name} {{ {name}(Int) }}")
         } else {
-            "struct"
+            format!("struct {name}(Int)")
         };
 
         uwrite!(
             self.src,
             r#"
-            pub(all) {declaration} {name}(Int) derive({})
+            pub(all) {type_definition} derive({})
             "#,
             deriviation.join(", "),
         );
@@ -1285,6 +1286,7 @@ impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
                 &mut self.src,
                 r#"
                 /// Destructor of the resource.
+                #warnings("-declaration_unimplemented")
                 declare pub fn {name}::dtor(_self : {name}) -> Unit
                 "#
             );
@@ -1379,16 +1381,16 @@ impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
         if self.derive_opts.derive_eq {
             deriviation.push("Eq")
         }
-        let declaration = if self.derive_opts.derive_error && name.contains("Error") {
-            "suberror"
+        let type_definition = if self.derive_opts.derive_error && name.contains("Error") {
+            format!("suberror {name} {{ {name}({ty}) }}")
         } else {
-            "struct"
+            format!("struct {name}({ty})")
         };
 
         uwrite!(
             self.src,
             "
-            pub(all) {declaration} {name}({ty}) derive({})
+            pub(all) {type_definition} derive({})
             pub fn {name}::default() -> {name} {{
                 {}
             }}
@@ -3326,6 +3328,8 @@ fn world_contains_future_or_stream(resolve: &Resolve, world: WorldId) -> bool {
 fn indent(code: &str) -> Source {
     let mut indented = Source::default();
     let mut was_empty = false;
+    let mut depth = 0usize;
+    let mut has_top_level_separator = false;
     for line in code.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -3338,13 +3342,46 @@ fn indent(code: &str) -> Source {
         }
 
         if trimmed.starts_with('}') {
+            depth = depth.saturating_sub(1);
             indented.deindent(2)
+        }
+        let starts_declaration = [
+            "async fn ",
+            "declare ",
+            "enum ",
+            "extern ",
+            "fn ",
+            "impl ",
+            "let ",
+            "priv ",
+            "pub ",
+            "struct ",
+            "suberror ",
+            "type ",
+        ]
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix));
+        let starts_metadata = (trimmed.starts_with("///") && trimmed != "///|")
+            || (trimmed.starts_with('#') && !trimmed.starts_with("#|"));
+        if depth == 0 && starts_metadata && !has_top_level_separator {
+            indented.push_str("///|\n");
+            has_top_level_separator = true;
+        }
+        if depth == 0 && starts_declaration && !has_top_level_separator {
+            indented.push_str("///|\n");
+        }
+        if depth == 0 && starts_declaration {
+            has_top_level_separator = false;
         }
         indented.push_str(trimmed);
         if trimmed.ends_with('{') && !trimmed.starts_with("///") {
+            depth += 1;
             indented.indent(2)
         }
         indented.push_str("\n");
+        if depth == 0 && trimmed == "///|" {
+            has_top_level_separator = true;
+        }
     }
     indented
 }
@@ -3490,15 +3527,15 @@ mod tests {
         assert_eq!(
             fingerprints,
             vec![
-                ("gen/ffi.mbt".into(), 10220319382745692950),
-                ("gen/moon.pkg.json".into(), 15894505084782869543),
-                ("gen/world/runner/ffi.mbt".into(), 14715999128234894449),
-                ("gen/world/runner/moon.pkg.json".into(), 6361049410124596525,),
-                ("gen/world/runner/top.mbt".into(), 12192865914091673515,),
+                ("gen/ffi.mbt".into(), 3015121443139333543),
+                ("gen/moon.pkg.json".into(), 4016311361297189155),
+                ("gen/world/runner/ffi.mbt".into(), 7191242004779882714),
+                ("gen/world/runner/moon.pkg.json".into(), 6277720927474812145,),
+                ("gen/world/runner/top.mbt".into(), 6857206758629669597,),
                 ("moon.mod.json".into(), 14111159726816684443),
-                ("world/runner/ffi_import.mbt".into(), 17812050158059242657,),
+                ("world/runner/ffi_import.mbt".into(), 16979266963551268444,),
                 ("world/runner/import.mbt".into(), 5430383198437179961),
-                ("world/runner/moon.pkg.json".into(), 6361049410124596525,),
+                ("world/runner/moon.pkg.json".into(), 6277720927474812145,),
             ]
         );
     }
@@ -3698,6 +3735,45 @@ mod tests {
         assert!(!source.contains(
             "Streamed {\n      None\n      Value(Array[@async-core.Stream[String]])\n} derive("
         ));
+    }
+
+    #[test]
+    fn generated_sources_use_current_moonbit_warning_safe_syntax() {
+        let mut opts = Opts {
+            gen_dir: "gen".into(),
+            ..Opts::default()
+        };
+        opts.derive.derive_error = true;
+        let files = try_generate_with_opts(
+            r#"
+                package a:b;
+
+                interface api {
+                    resource io-error;
+                    flags app-error { failed }
+                    use-types: func(value: borrow<io-error>, options: app-error);
+                }
+
+                world runner { import api; }
+            "#,
+            "runner",
+            opts,
+        )
+        .unwrap();
+
+        let source = file(&files, "interface/a/b/api/top.mbt");
+        assert!(
+            source.contains("suberror IoError { IoError(Int) }"),
+            "{source}"
+        );
+        assert!(
+            source.contains("suberror AppError { AppError(Byte) }"),
+            "{source}"
+        );
+        let ffi = file(&files, "interface/a/b/api/ffi.mbt");
+        assert!(ffi.contains("///|\nfn "), "{ffi}");
+        let package = file(&files, "interface/a/b/api/moon.pkg.json");
+        assert!(package.contains("-unused_value-declaration_unimplemented"));
     }
 
     #[test]
