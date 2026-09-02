@@ -1,16 +1,35 @@
 //@ async = true
+//@ dependencies = ['test', 'observer-service']
 
 package test:moonbit-stream-producer-failure;
 
+interface observer {
+  resource leaf {
+    constructor();
+  }
+
+  mark: func(stage: u8);
+}
+
 interface operations {
+  use observer.{leaf};
+
   fail-after-write: async func() -> stream<u8>;
+  nested-failure: async func() -> stream<u8>;
+  relay-failure: async func() -> stream<leaf>;
 }
 
 world test {
+  import observer;
   export operations;
+}
+
+world observer-service {
+  export observer;
 }
 
 world runner {
   import operations;
+  import observer;
   export run: async func();
 }

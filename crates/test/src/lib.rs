@@ -199,7 +199,7 @@ struct Component {
     wasmtime_flags: config::StringList,
 
     /// Expected text when execution of this component's runtime case fails.
-    runtime_failure: Option<String>,
+    runtime_failure: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -476,7 +476,7 @@ impl Runner {
             contents,
             lang_config: config.lang,
             wasmtime_flags: config.wasmtime_flags,
-            runtime_failure: config.runtime_failure,
+            runtime_failure: config.runtime_failure.into(),
         })
     }
 
@@ -779,25 +779,34 @@ impl Runner {
                         let expected_failure = [&runner]
                             .into_iter()
                             .chain(test_components.iter().map(|(component, _)| component))
-                            .find_map(|component| component.runtime_failure.as_deref());
+                            .flat_map(|component| component.runtime_failure.iter())
+                            .map(String::as_str)
+                            .collect::<Vec<_>>();
                         let result = me
                             .runtime_test(&case, &runner, &runner_path, &test_components)
                             .with_context(|| format!("failed to run `{}`", case.name));
-                        let result = match (result, expected_failure) {
-                            (Ok(()), Some(expected)) => Err(anyhow::anyhow!(
-                                "runtime test succeeded instead of failing with `{expected}`"
-                            )),
-                            (Err(error), Some(expected)) => {
-                                let message = format!("{error:#}");
-                                if message.contains(expected) {
-                                    Ok(())
-                                } else {
-                                    Err(error.context(format!(
-                                        "runtime failure did not contain `{expected}`"
-                                    )))
+                        let result = if expected_failure.is_empty() {
+                            result
+                        } else {
+                            match result {
+                                Ok(()) => Err(anyhow::anyhow!(
+                                    "runtime test succeeded instead of failing with all of {expected_failure:?}"
+                                )),
+                                Err(error) => {
+                                    let message = format!("{error:#}");
+                                    let missing = expected_failure
+                                        .iter()
+                                        .filter(|expected| !message.contains(*expected))
+                                        .collect::<Vec<_>>();
+                                    if missing.is_empty() {
+                                        Ok(())
+                                    } else {
+                                        Err(error.context(format!(
+                                            "runtime failure did not contain {missing:?}"
+                                        )))
+                                    }
                                 }
                             }
-                            (result, None) => result,
                         };
                         me.render_error(
                             StepResult::new(result)

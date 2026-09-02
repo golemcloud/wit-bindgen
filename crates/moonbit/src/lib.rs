@@ -4165,12 +4165,30 @@ mod tests {
         assert!(
             event_loop.contains("abort(\"async export failed before task return\")")
                 && event_loop.contains("if !(ev.resolved.get(waitable_set) is Some(true))")
-                && event_loop.contains("abort(\"component task-owned coroutine failed\")")
+                && event_loop
+                    .contains("abort(\"component task-owned coroutine failed after cleanup\")")
                 && event_loop
                     .contains("Cancelled::Cancelled as err if is_being_cancelled() => raise err")
-                && event_loop.contains("ev.owned_failure.set(waitable_set, true)"),
+                && event_loop.contains("begin_owned_failure_drain(waitable_set, coro)")
+                && event_loop.contains("ev.owned_failure.set(waitable_set, true)")
+                && event_loop.contains("root.cancel()")
+                && event_loop.contains("owned.each(fn(coro)")
+                && event_loop.contains("ev.cancellations.set(waitable_set, Requested)"),
             "{event_loop}"
         );
+        let terminal = event_loop
+            .find("if ev.finished.get(waitable_set) is Some(true) && no_more_work(waitable_set)")
+            .unwrap();
+        let terminal = &event_loop[terminal..];
+        let snapshot = terminal.find("let owned_failed =").unwrap();
+        let finish = terminal.find("finish_waitableset(waitable_set)").unwrap();
+        let abort = terminal
+            .find("abort(\"component task-owned coroutine failed after cleanup\")")
+            .unwrap();
+        assert!(snapshot < finish && finish < abort, "{terminal}");
+        assert!(!event_loop.contains(
+            "if ev.owned_failure.get(waitable_set) is Some(true) {\n    finish_waitableset"
+        ));
     }
 
     #[test]
@@ -4196,11 +4214,19 @@ mod tests {
             "local producer cleanup must close without swallowing its outcome: {async_trait}"
         );
         assert!(
-            ffi.contains("run_producer() catch {")
-                && ffi.contains("err => {")
+            ffi.contains("errdefer {")
+                && ffi.contains("run_producer()")
                 && ffi.contains("close_writer_serialized()")
-                && ffi.contains("raise err"),
+                && !ffi.contains("run_producer() catch {"),
             "producer failure and cancellation must clean up and propagate: {ffi}"
+        );
+        let failure = &ffi[ffi.find("errdefer {").unwrap()..];
+        let reject = failure.find("() => stream.reject(cleanup_value)").unwrap();
+        let close = failure.find("() => close_writer_serialized()").unwrap();
+        let producer = failure.find("run_producer()").unwrap();
+        assert!(
+            reject < close && close < producer,
+            "relay rejection and serialized close must guard producer failure: {failure}"
         );
         assert!(
             ffi.contains("let mut total = 0")
