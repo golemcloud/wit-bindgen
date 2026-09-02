@@ -1,0 +1,16 @@
+//@ async = true
+
+package test:moonbit-stream-producer-failure;
+
+interface operations {
+  fail-after-write: async func() -> stream<u8>;
+}
+
+world test {
+  export operations;
+}
+
+world runner {
+  import operations;
+  export run: async func();
+}

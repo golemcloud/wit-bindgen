@@ -4184,9 +4184,16 @@ mod tests {
         );
 
         let ffi = file(&files, "gen/world/service/ffi.mbt");
+        let async_trait = file(&files, "async-core/async_trait.mbt");
         assert!(
             ffi.contains("producer(sink)") && ffi.contains("sink.close()"),
             "normal producer return must close the stream: {ffi}"
+        );
+        assert!(
+            async_trait.contains(
+                "defer {\n              sink.close() catch {\n                _ => ()\n              }\n            }\n            producer(sink)"
+            ),
+            "local producer cleanup must close without swallowing its outcome: {async_trait}"
         );
         assert!(
             ffi.contains("run_producer() catch {")

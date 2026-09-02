@@ -48,6 +48,9 @@ async fn materializes_a_lazy_stream_after_return() {
     let (result, values) = stream.read(Vec::with_capacity(1)).await;
     assert_eq!(result, StreamResult::Complete(1));
     assert_eq!(values, [42]);
+    let (result, values) = stream.read(Vec::with_capacity(1)).await;
+    assert_eq!(result, StreamResult::Dropped);
+    assert!(values.is_empty());
 }
 
 async fn serializes_concurrent_stream_writes() {

@@ -94,7 +94,6 @@ pub async fn post_return_lazy(
       guard nested_sink.write_all(data[:]) else {
         abort("nested stream closed before accepting its value")
       }
-      nested_sink.close()
     })
     guard nested.read(1) is Some(data) && data.length() == 1 else {
       abort("nested stream did not produce its value")
@@ -103,7 +102,6 @@ pub async fn post_return_lazy(
       abort("component stream closed before accepting its value")
     }
     nested.drop()
-    sink.close()
   })
 }
 
