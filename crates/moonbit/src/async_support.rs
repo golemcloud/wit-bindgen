@@ -2143,7 +2143,7 @@ fn wasm{symbol_name}StreamCommit(handle : Int) -> Unit {{
             }}
         }}
         run_producer() catch {{
-            _ =>
+            err => {{
                 if relay_source {{
                     {ffi}protect_from_cancel(
                         () => stream.reject(cleanup_value),
@@ -2152,6 +2152,12 @@ fn wasm{symbol_name}StreamCommit(handle : Int) -> Unit {{
                         _ => ()
                     }}
                 }}
+                {ffi}protect_from_cancel(
+                    () => close_writer_serialized(),
+                    resume_on_cancel=true,
+                )
+                raise err
+            }}
         }}
         // A retained Sink may still own an in-flight canonical write after its
         // producer returns. Do not drop the writable endpoint until that write

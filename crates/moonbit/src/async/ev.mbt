@@ -18,6 +18,7 @@ priv struct EventLoop {
   wakeups : Map[WaitableSet, TaskWakeup]
   tasks : Map[WaitableSet, Coroutine]
   owned_coroutines : Map[WaitableSet, @set.Set[Coroutine]]
+  owned_failure : Map[WaitableSet, Bool]
   finished : Map[WaitableSet, Bool]
   resolved : Map[WaitableSet, Bool]
   cancellations : Map[WaitableSet, TaskCancellation]
@@ -75,6 +76,7 @@ fn clear_subscribers(waitable_set : WaitableSet) -> Unit {
 fn finish_waitableset(waitable_set : WaitableSet) -> Unit {
   ev.tasks.remove(waitable_set)
   ev.owned_coroutines.remove(waitable_set)
+  ev.owned_failure.remove(waitable_set)
   ev.finished.remove(waitable_set)
   ev.resolved.remove(waitable_set)
   ev.cancellations.remove(waitable_set)
@@ -136,6 +138,10 @@ fn next_callback(waitable_set : WaitableSet) -> Int {
     reschedule(waitable_set)
   }
   acknowledge_cancellation(waitable_set)
+  if ev.owned_failure.get(waitable_set) is Some(true) {
+    finish_waitableset(waitable_set)
+    abort("component task-owned coroutine failed")
+  }
   if ev.finished.get(waitable_set) is Some(true) && no_more_work(waitable_set) {
     let resolved = ev.resolved.get(waitable_set) is Some(true)
     let failed = match ev.tasks.get(waitable_set) {
@@ -253,6 +259,7 @@ let ev : EventLoop = {
   wakeups: Map([]),
   tasks: Map([]),
   owned_coroutines: Map([]),
+  owned_failure: Map([]),
   finished: Map([]),
   resolved: Map([]),
   cancellations: Map([]),
@@ -277,7 +284,13 @@ pub fn spawn_component_task_current(f : async () -> Unit) -> Unit {
     async fn() -> Unit {
       let coro = current_coroutine()
       defer owned.remove(coro)
-      f()
+      f() catch {
+        Cancelled::Cancelled as err if is_being_cancelled() => raise err
+        err => {
+          ev.owned_failure.set(waitable_set, true)
+          raise err
+        }
+      }
     },
     waitable_set,
     Some(spawn_component_task_current),

@@ -4164,8 +4164,42 @@ mod tests {
         let event_loop = file(&files, "async-core/async_ev.mbt");
         assert!(
             event_loop.contains("abort(\"async export failed before task return\")")
-                && event_loop.contains("if !(ev.resolved.get(waitable_set) is Some(true))"),
+                && event_loop.contains("if !(ev.resolved.get(waitable_set) is Some(true))")
+                && event_loop.contains("abort(\"component task-owned coroutine failed\")")
+                && event_loop
+                    .contains("Cancelled::Cancelled as err if is_being_cancelled() => raise err")
+                && event_loop.contains("ev.owned_failure.set(waitable_set, true)"),
             "{event_loop}"
+        );
+    }
+
+    #[test]
+    fn lowered_lazy_stream_producer_preserves_terminal_outcomes() {
+        let files = generate(
+            r#"
+            package test:stream-outcomes;
+            world service { export produce: async func() -> stream<u32>; }
+            "#,
+            "service",
+        );
+
+        let ffi = file(&files, "gen/world/service/ffi.mbt");
+        assert!(
+            ffi.contains("producer(sink)") && ffi.contains("sink.close()"),
+            "normal producer return must close the stream: {ffi}"
+        );
+        assert!(
+            ffi.contains("run_producer() catch {")
+                && ffi.contains("err => {")
+                && ffi.contains("close_writer_serialized()")
+                && ffi.contains("raise err"),
+            "producer failure and cancellation must clean up and propagate: {ffi}"
+        );
+        assert!(
+            ffi.contains("let mut total = 0")
+                && ffi.contains("while total < data_len")
+                && ffi.contains("settle_staging(total)"),
+            "accepted writes must retain exact back-pressure and staging cleanup: {ffi}"
         );
     }
 

@@ -779,14 +779,7 @@ fn[X] materialize_stream_producer(
           state.val.on_unstarted_drop = None
           let sink = stream_pipe_sink(pipe)
           spawn_stream_producer(async fn() {
-            producer(sink) catch {
-              _ => {
-                sink.close() catch {
-                  _ => ()
-                }
-                return
-              }
-            }
+            producer(sink)
             sink.close()
           })
         }
