@@ -4237,6 +4237,42 @@ mod tests {
     }
 
     #[test]
+    fn byte_stream_windows_are_bounded_before_copying() {
+        // Match the WASI filesystem write-via-stream direction: an imported
+        // resource method consumes the caller's stream<u8>.
+        let files = generate(
+            r#"
+            package wasi:filesystem@0.3.0;
+            interface types {
+                type byte = u8;
+                resource descriptor {
+                    write-via-stream: async func(data: stream<u8>) -> u64;
+                    write-alias: async func(data: stream<byte>) -> u64;
+                    write-words: async func(data: stream<u64>) -> u64;
+                }
+            }
+            world service { import types; }
+            "#,
+            "service",
+        );
+        let ffi = file(&files, "interface/wasi/filesystem/types/ffi.mbt");
+        assert_eq!(ffi.matches("write_window_size=65536").count(), 2);
+        assert_eq!(ffi.matches("let data_len = if data.length() < 65536").count(), 2);
+        assert_eq!(ffi.matches("write_window_size=64").count(), 1);
+        assert!(ffi.contains("[async-lower][stream-write-0][method]descriptor.write-via-stream"));
+        assert!(ffi.contains("ptr + total * 1"));
+        assert!(ffi.contains("data_len - total"));
+
+        let runtime = file(&files, "async-core/async_trait.mbt");
+        for method in ["Sink::write(self", "Sink::write_bytes(self"] {
+            let body = &runtime[runtime.find(method).unwrap()..];
+            let cap = body.find("let length = if data.length() < self.write_window_size").unwrap();
+            let copy = body.find("FixedArray::makei(length, i => data[i])").unwrap();
+            assert!(cap < copy);
+        }
+    }
+
+    #[test]
     fn async_runtime_borrows_waitable_poll_payload() {
         let files = generate(
             r#"

@@ -1234,8 +1234,24 @@ impl<'a> InterfaceGenerator<'a> {
             .map(|ty| self.world_gen.sizes.size(ty).size_wasm32())
             .unwrap_or(0);
         let read_chunk_owns_buffer = result_type.is_some_and(|ty| self.is_list_canonical(ty));
-        let staging_window = if payload_sites.is_empty() { 64 } else { 1 };
-        let max_read_count = 64;
+        // Bound the canonical buffer by bytes, not just element count. Keep
+        // the conservative element cap for non-byte payloads (which can own
+        // arbitrarily large nested lists), and serialize nested endpoints.
+        let mut payload = result_type.copied();
+        while let Some(Type::Id(id)) = payload {
+            match self.resolve.types[id].kind {
+                TypeDefKind::Type(ty) => payload = Some(ty),
+                _ => break,
+            }
+        }
+        let byte_stream = payload == Some(Type::U8);
+        let element_limit = if byte_stream { 65536 } else { 64 };
+        let max_read_count = element_limit.min((65536 / elem_size.max(1)).max(1));
+        let staging_window = if payload_sites.is_empty() {
+            max_read_count
+        } else {
+            1
+        };
 
         let EndpointPayloadFragments {
             lift,
@@ -2118,6 +2134,7 @@ fn wasm{symbol_name}StreamCommit(handle : Int) -> Unit {{
             () => close_writer_serialized(),
             () => !writer_closed.val,
             Some(cleanup_value),
+            write_window_size={staging_window},
         )
         let relay_source = producer is None
         let run_producer = async fn() -> Unit {{

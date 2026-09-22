@@ -12,6 +12,39 @@ priv struct LocalOnlyValue {
 
 ///|
 pub async fn exercise(background_group : @async-core.TaskGroup[Unit]) -> Bool {
+  // Exercise both borrowed-view entry points across the byte budget boundary.
+  // The callback deliberately accepts only part of the first window, so the
+  // second call must resume at the accepted offset, not at the staging limit.
+  let calls = Ref(0)
+  let consumed = Ref(0)
+  let sink : @async-core.Sink[Byte] = @async-core.Sink::from_callbacks(
+    data => {
+      calls.val = calls.val + 1
+      guard data.length() <= 65536 else { panic() }
+      let n = if calls.val == 1 { 17 } else { data.length() }
+      for i in 0..<n {
+        guard data[i] == ((consumed.val + i) % 251).to_byte() else { panic() }
+      }
+      consumed.val = consumed.val + n
+      n
+    },
+    () => (),
+    () => true,
+    None,
+    write_window_size=65536,
+  )
+  let bytes = Bytes::makei(131073, i => (i % 251).to_byte())
+  guard sink.write_bytes(bytes[:]) == 17 else { return false }
+  guard sink.write_all_bytes(bytes[17:]) else { return false }
+  guard consumed.val == 131073 && calls.val == 3 else { return false }
+  consumed.val = 0
+  calls.val = 1
+  let array = FixedArray::makei(65537, i => (i % 251).to_byte())
+  guard sink.write(array[:]) == 65536 else { return false }
+  guard sink.write_all(array[65536:]) else { return false }
+  guard consumed.val == 65537 && calls.val == 3 else { return false }
+  guard sink.write(array[0:0]) == 0 && calls.val == 3 else { return false }
+
   let semaphore = @async-core.Semaphore(1, initial_value=1)
   guard semaphore.try_acquire() else { return false }
   guard !semaphore.try_acquire() else { return false }
