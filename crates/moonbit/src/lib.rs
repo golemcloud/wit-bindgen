@@ -15,8 +15,8 @@ use wit_bindgen_core::{
     wit_parser::{
         Alignment, ArchitectureSize, Docs, Enum, Flags, FlagsRepr, Function, Int, InterfaceId,
         LiftLowerAbi, LiveTypes, ManglingAndAbi, Param, Record, Resolve, ResourceIntrinsic,
-        Result_, SizeAlign, Tuple, Type, TypeDefKind, TypeId, Variant, WasmExport, WasmExportKind,
-        WasmImport, WorldId, WorldItem, WorldKey,
+        Result_, SizeAlign, Tuple, Type, TypeDefKind, TypeId, TypeOwner, Variant, WasmExport,
+        WasmExportKind, WasmImport, WorldId, WorldItem, WorldKey,
     },
 };
 
@@ -146,6 +146,9 @@ pub struct MoonBit {
     opts: Opts,
     project_name: String,
     import_world_fragment: InterfaceFragment,
+    export_lower_fragment: InterfaceFragment,
+    export_lower_helpers: BTreeMap<TypeId, String>,
+    export_lift_helpers: BTreeMap<TypeId, String>,
     sizes: SizeAlign,
 
     // Collision may happen when a package is imported with multiple versions.
@@ -170,6 +173,62 @@ pub struct MoonBit {
 }
 
 impl MoonBit {
+    fn export_lower_package(&self) -> String {
+        format!("{}.wit_bindgen_export_lower", self.opts.r#gen_dir)
+    }
+
+    fn can_share_export_lower_helper(&self, resolve: &Resolve, ty: &Type) -> bool {
+        let Type::Id(id) = ty else { return true };
+        match &resolve.types[*id].kind {
+            TypeDefKind::Type(ty) => self.can_share_export_lower_helper(resolve, ty),
+            TypeDefKind::Record(record) => {
+                matches!(
+                    resolve.types[*id].owner,
+                    TypeOwner::Interface(owner)
+                        if self.pkg_resolver.import_interface_names.contains_key(&owner)
+                ) && record
+                    .fields
+                    .iter()
+                    .all(|field| self.can_share_export_lower_helper(resolve, &field.ty))
+            }
+            TypeDefKind::Variant(variant) => {
+                matches!(
+                    resolve.types[*id].owner,
+                    TypeOwner::Interface(owner)
+                        if self.pkg_resolver.import_interface_names.contains_key(&owner)
+                ) && variant.cases.iter().all(|case| {
+                    case.ty
+                        .as_ref()
+                        .is_none_or(|ty| self.can_share_export_lower_helper(resolve, ty))
+                })
+            }
+            TypeDefKind::List(ty)
+            | TypeDefKind::Option(ty)
+            | TypeDefKind::FixedLengthList(ty, _) => {
+                self.can_share_export_lower_helper(resolve, ty)
+            }
+            TypeDefKind::Tuple(tuple) => tuple
+                .types
+                .iter()
+                .all(|ty| self.can_share_export_lower_helper(resolve, ty)),
+            TypeDefKind::Result(result) => {
+                result
+                    .ok
+                    .as_ref()
+                    .is_none_or(|ty| self.can_share_export_lower_helper(resolve, ty))
+                    && result
+                        .err
+                        .as_ref()
+                        .is_none_or(|ty| self.can_share_export_lower_helper(resolve, ty))
+            }
+            TypeDefKind::Map(key, value) => {
+                self.can_share_export_lower_helper(resolve, key)
+                    && self.can_share_export_lower_helper(resolve, value)
+            }
+            _ => true,
+        }
+    }
+
     fn interface<'a>(
         &'a mut self,
         resolve: &'a Resolve,
@@ -189,10 +248,19 @@ impl MoonBit {
             derive_opts,
             interface,
             lower_helpers: BTreeMap::new(),
+            new_export_lower_helpers: BTreeSet::new(),
+            lift_helpers: BTreeMap::new(),
+            new_export_lift_helpers: BTreeSet::new(),
         }
     }
 
-    fn write_moon_pkg(&self, moon_pkg: &mut Source, imports: Option<&Imports>, link: bool) {
+    fn write_moon_pkg(
+        &self,
+        moon_pkg: &mut Source,
+        imports: Option<&Imports>,
+        link: bool,
+        wasm_only: bool,
+    ) {
         // Inline Wasm and private canonical-ABI helpers are intentional in generated packages.
         moon_pkg.push_str("{\n\"warn-list\": \"-44-unused_value-declaration_unimplemented\"");
         // Dependencies
@@ -218,7 +286,7 @@ impl MoonBit {
         }
         let imports_async_core =
             imports.is_some_and(|imports| imports.packages.contains_key(ASYNC_CORE_DIR));
-        if imports_async_core || (link && self.async_support.is_required()) {
+        if wasm_only || imports_async_core || (link && self.async_support.is_required()) {
             moon_pkg.push_str(",\n\"supported-targets\": \"+wasm\"");
         }
         // Link target
@@ -386,6 +454,7 @@ impl WorldGenerator for MoonBit {
                 &mut moon_pkg,
                 self.pkg_resolver.package_import.get(&name),
                 false,
+                false,
             );
             files.push(&format!("{directory}/moon.pkg.json"), moon_pkg.as_bytes());
         }
@@ -463,6 +532,7 @@ impl WorldGenerator for MoonBit {
             &mut moon_pkg,
             self.pkg_resolver.package_import.get(&name),
             false,
+            false,
         );
         files.push(&format!("{directory}/moon.pkg.json"), moon_pkg.as_bytes());
     }
@@ -491,6 +561,7 @@ impl WorldGenerator for MoonBit {
             r#gen.export(func);
         }
 
+        r#gen.generate_lift_helper_bodies();
         r#gen.generate_lower_helper_bodies();
 
         let fragment = r#gen.finish();
@@ -520,6 +591,7 @@ impl WorldGenerator for MoonBit {
                 self.write_moon_pkg(
                     &mut moon_pkg,
                     self.pkg_resolver.package_import.get(&name),
+                    false,
                     false,
                 );
                 files.push(&format!("{directory}/moon.pkg.json"), moon_pkg.as_bytes());
@@ -557,6 +629,7 @@ impl WorldGenerator for MoonBit {
             r#gen.export(func);
         }
 
+        r#gen.generate_lift_helper_bodies();
         r#gen.generate_lower_helper_bodies();
 
         let fragment = r#gen.finish();
@@ -576,6 +649,7 @@ impl WorldGenerator for MoonBit {
                 self.write_moon_pkg(
                     &mut moon_pkg,
                     self.pkg_resolver.package_import.get(&name),
+                    false,
                     false,
                 );
                 files.push(&format!("{directory}/moon.pkg.json"), moon_pkg.as_bytes());
@@ -626,11 +700,36 @@ impl WorldGenerator for MoonBit {
             indent(&body).as_bytes(),
         );
 
+        if !self.export_lower_fragment.ffi.is_empty() {
+            let package = self.export_lower_package();
+            let directory = package.replace('.', "/");
+            let mut ffi = Source::default();
+            wit_bindgen_core::generated_preamble(&mut ffi, VERSION);
+            uwriteln!(ffi, "{}", self.export_lower_fragment.ffi);
+            for builtin in &self.export_lower_fragment.builtins {
+                uwriteln!(ffi, "{}", builtin);
+            }
+            files.push(&format!("{directory}/ffi.mbt"), indent(&ffi).as_bytes());
+
+            let mut package_file = Source::default();
+            self.write_moon_pkg(
+                &mut package_file,
+                self.pkg_resolver.package_import.get(&package),
+                false,
+                true,
+            );
+            files.push(
+                &format!("{directory}/moon.pkg.json"),
+                package_file.as_bytes(),
+            );
+        }
+
         let mut moon_pkg = Source::default();
         self.write_moon_pkg(
             &mut moon_pkg,
             self.pkg_resolver.package_import.get(&self.opts.r#gen_dir),
             true,
+            false,
         );
         files.push(
             &format!("{}/moon.pkg.json", self.opts.r#gen_dir),
@@ -664,6 +763,9 @@ struct InterfaceGenerator<'a> {
     // inlining the full recursive lower at each call site. This keeps the
     // generated `wasmExport*` functions small enough for `moonc` to compile.
     lower_helpers: BTreeMap<TypeId, String>,
+    new_export_lower_helpers: BTreeSet<TypeId>,
+    lift_helpers: BTreeMap<TypeId, String>,
+    new_export_lift_helpers: BTreeSet<TypeId>,
 }
 
 impl InterfaceGenerator<'_> {
@@ -672,6 +774,85 @@ impl InterfaceGenerator<'_> {
             src: self.src,
             ffi: self.ffi,
             builtins: self.ffi_imports,
+        }
+    }
+
+    fn register_lift_helpers(&mut self, ty: &Type) {
+        let Type::Id(id) = ty else { return };
+        let id = *id;
+        match &self.resolve.types[id].kind {
+            TypeDefKind::Type(ty) => {
+                let ty = *ty;
+                self.register_lift_helpers(&ty);
+            }
+            TypeDefKind::Record(_) | TypeDefKind::Variant(_) => {
+                if self.lift_helpers.contains_key(&id) {
+                    return;
+                }
+                let name = if self
+                    .world_gen
+                    .can_share_export_lower_helper(self.resolve, &Type::Id(id))
+                {
+                    let helper_name = format!("wit_bindgen_lift_t{}", id.index());
+                    if self
+                        .world_gen
+                        .export_lift_helpers
+                        .insert(id, helper_name.clone())
+                        .is_none()
+                    {
+                        self.new_export_lift_helpers.insert(id);
+                    }
+                    let package = self.world_gen.export_lower_package();
+                    format!(
+                        "{}{}",
+                        self.world_gen
+                            .pkg_resolver
+                            .qualify_package(self.name, &package),
+                        helper_name
+                    )
+                } else {
+                    format!("__wit_bindgen_lift_t{}", id.index())
+                };
+                self.lift_helpers.insert(id, name);
+                let children: Vec<Type> = match &self.resolve.types[id].kind {
+                    TypeDefKind::Record(record) => {
+                        record.fields.iter().map(|field| field.ty).collect()
+                    }
+                    TypeDefKind::Variant(variant) => {
+                        variant.cases.iter().filter_map(|case| case.ty).collect()
+                    }
+                    _ => Vec::new(),
+                };
+                for child in children {
+                    self.register_lift_helpers(&child);
+                }
+            }
+            TypeDefKind::List(ty)
+            | TypeDefKind::Option(ty)
+            | TypeDefKind::FixedLengthList(ty, _) => {
+                let ty = *ty;
+                self.register_lift_helpers(&ty);
+            }
+            TypeDefKind::Tuple(tuple) => {
+                for ty in tuple.types.clone() {
+                    self.register_lift_helpers(&ty);
+                }
+            }
+            TypeDefKind::Result(result) => {
+                if let Some(ty) = result.ok {
+                    self.register_lift_helpers(&ty);
+                }
+                if let Some(ty) = result.err {
+                    self.register_lift_helpers(&ty);
+                }
+            }
+            TypeDefKind::Map(key, value) => {
+                let key = *key;
+                let value = *value;
+                self.register_lift_helpers(&key);
+                self.register_lift_helpers(&value);
+            }
+            _ => {}
         }
     }
 
@@ -697,7 +878,30 @@ impl InterfaceGenerator<'_> {
                 if self.lower_helpers.contains_key(&id) {
                     return;
                 }
-                let name = format!("__wit_bindgen_lower_t{}", id.index());
+                let name = if self
+                    .world_gen
+                    .can_share_export_lower_helper(self.resolve, &Type::Id(id))
+                {
+                    let helper_name = format!("wit_bindgen_lower_t{}", id.index());
+                    if self
+                        .world_gen
+                        .export_lower_helpers
+                        .insert(id, helper_name.clone())
+                        .is_none()
+                    {
+                        self.new_export_lower_helpers.insert(id);
+                    }
+                    let package = self.world_gen.export_lower_package();
+                    format!(
+                        "{}{}",
+                        self.world_gen
+                            .pkg_resolver
+                            .qualify_package(self.name, &package),
+                        helper_name
+                    )
+                } else {
+                    format!("__wit_bindgen_lower_t{}", id.index())
+                };
                 self.lower_helpers.insert(id, name);
                 // Collect child types first to avoid borrow conflicts.
                 let children: Vec<Type> = match &self.resolve.types[id].kind {
@@ -744,13 +948,18 @@ impl InterfaceGenerator<'_> {
     /// root type is lowered inline (one level deep) via
     /// [`abi::lower_to_memory_root`]; nested named aggregates are outlined
     /// into calls to their own helpers.
-    fn generate_lower_helper_bodies(&mut self) {
-        let ids: Vec<TypeId> = self.lower_helpers.keys().copied().collect();
+    fn generate_lower_helper_bodies_for(
+        &mut self,
+        ids: Vec<TypeId>,
+        package: &str,
+        public: bool,
+    ) -> String {
         let resolve = self.resolve;
+        let mut output = String::new();
         for id in ids {
             let name = self.lower_helpers[&id].clone();
             let ty = Type::Id(id);
-            let value_ty = self.world_gen.pkg_resolver.type_name(self.name, &ty);
+            let value_ty = self.world_gen.pkg_resolver.type_name(package, &ty);
 
             // The helper body is generated in a borrow scope so that
             // `FunctionBindgen`'s borrow of `self` ends before we write the
@@ -762,8 +971,12 @@ impl InterfaceGenerator<'_> {
                 // `ptr1`, ... instead of `ptr`, which would shadow the `ptr`
                 // parameter and make subsequent `(ptr) + offset` stores write
                 // to the string's own buffer instead of the result base.
-                let mut f =
-                    FunctionBindgen::new(self, Box::new(["ptr".to_string(), "value".to_string()]));
+                let mut f = FunctionBindgen::new_with_context(
+                    self,
+                    Box::new(["ptr".to_string(), "value".to_string()]),
+                    package,
+                    package,
+                );
                 abi::lower_to_memory_root(
                     resolve,
                     &mut f,
@@ -791,10 +1004,106 @@ impl InterfaceGenerator<'_> {
                 body
             };
 
+            let visibility = if public { "pub " } else { "" };
             uwriteln!(
-                self.ffi,
-                "\n#doc(hidden)\nfn {name}(ptr : Int, value : {value_ty}) -> Unit {{\n{body}\n}}\n"
+                output,
+                "\n#doc(hidden)\n{visibility}fn {name}(ptr : Int, value : {value_ty}) -> Unit {{\n{body}\n}}\n"
             );
+        }
+        output
+    }
+
+    fn generate_lift_helper_bodies_for(
+        &mut self,
+        ids: Vec<TypeId>,
+        package: &str,
+        public: bool,
+    ) -> String {
+        let resolve = self.resolve;
+        let mut output = String::new();
+        for id in ids {
+            let name = self.lift_helpers[&id].clone();
+            let ty = Type::Id(id);
+            let value_ty = self.world_gen.pkg_resolver.type_name(package, &ty);
+            let (body, value) = {
+                let mut f = FunctionBindgen::new_with_context(
+                    self,
+                    Box::new(["ptr".to_string()]),
+                    package,
+                    package,
+                );
+                let value = abi::lift_from_memory_root(resolve, &mut f, "ptr".to_string(), &ty, id);
+                let body = mem::take(&mut f.src);
+                assert!(
+                    !f.needs_cleanup_list,
+                    "outlined lift helper unexpectedly requires a cleanup list"
+                );
+                assert!(
+                    f.cleanup.is_empty(),
+                    "outlined lift helper unexpectedly produced cleanup entries"
+                );
+                (body, value)
+            };
+            let visibility = if public { "pub " } else { "" };
+            uwriteln!(
+                output,
+                "\n#doc(hidden)\n{visibility}fn {name}(ptr : Int) -> {value_ty} {{\n{body}\n{value}\n}}\n"
+            );
+        }
+        output
+    }
+
+    fn generate_lift_helper_bodies(&mut self) {
+        let local_ids = self
+            .lift_helpers
+            .iter()
+            .filter_map(|(id, name)| (!name.starts_with('@')).then_some(*id))
+            .collect();
+        let package = self.name.to_string();
+        let local_bodies = self.generate_lift_helper_bodies_for(local_ids, &package, false);
+        self.ffi.push_str(&local_bodies);
+
+        if !self.new_export_lift_helpers.is_empty() {
+            let package = self.world_gen.export_lower_package();
+            let interface_helpers = mem::replace(
+                &mut self.lift_helpers,
+                self.world_gen.export_lift_helpers.clone(),
+            );
+            let ids = self.new_export_lift_helpers.iter().copied().collect();
+            let bodies = self.generate_lift_helper_bodies_for(ids, &package, true);
+            self.lift_helpers = interface_helpers;
+            self.world_gen.export_lower_fragment.ffi.push_str(&bodies);
+            self.world_gen
+                .export_lower_fragment
+                .builtins
+                .extend(self.ffi_imports.iter().copied());
+        }
+    }
+
+    fn generate_lower_helper_bodies(&mut self) {
+        let local_ids = self
+            .lower_helpers
+            .iter()
+            .filter_map(|(id, name)| (!name.starts_with('@')).then_some(*id))
+            .collect();
+        let package = self.name.to_string();
+        let local_bodies = self.generate_lower_helper_bodies_for(local_ids, &package, false);
+        self.ffi.push_str(&local_bodies);
+
+        if !self.new_export_lower_helpers.is_empty() {
+            let package = self.world_gen.export_lower_package();
+            let interface_helpers = mem::replace(
+                &mut self.lower_helpers,
+                self.world_gen.export_lower_helpers.clone(),
+            );
+            let ids = self.new_export_lower_helpers.iter().copied().collect();
+            let bodies = self.generate_lower_helper_bodies_for(ids, &package, true);
+            self.lower_helpers = interface_helpers;
+            self.world_gen.export_lower_fragment.ffi.push_str(&bodies);
+            self.world_gen
+                .export_lower_fragment
+                .builtins
+                .extend(self.ffi_imports.iter().copied());
         }
     }
 
@@ -908,6 +1217,10 @@ impl InterfaceGenerator<'_> {
         );
 
         let endpoint_plan = self.export_async_function_plan(self.interface, func);
+
+        for param in &func.params {
+            self.register_lift_helpers(&param.ty);
+        }
 
         // Register shared lower-to-memory helpers for the named aggregate
         // types reached from this export's result so that the recursive lower
@@ -1648,15 +1961,24 @@ impl<'a, 'b> FunctionBindgen<'a, 'b> {
         r#gen: &'b mut InterfaceGenerator<'a>,
         params: Box<[String]>,
     ) -> FunctionBindgen<'a, 'b> {
+        let context = r#gen.name.to_string();
+        Self::new_with_context(r#gen, params, &context, &context)
+    }
+
+    fn new_with_context(
+        r#gen: &'b mut InterfaceGenerator<'a>,
+        params: Box<[String]>,
+        type_context: &str,
+        func_interface: &str,
+    ) -> FunctionBindgen<'a, 'b> {
         let mut locals = Ns::default();
         params.iter().for_each(|str| {
             locals.tmp(str);
         });
-        let type_context = r#gen.name.to_string();
         Self {
             interface_gen: r#gen,
-            func_interface: type_context.clone(),
-            type_context,
+            func_interface: func_interface.to_string(),
+            type_context: type_context.to_string(),
             params,
             src: String::new(),
             locals,
@@ -2601,10 +2923,16 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                 ))
             }
 
-            Instruction::LiftNamedFromMemory { .. } => unreachable!(
-                "LiftNamedFromMemory is only emitted by generators that implement \
-                 Bindgen::lift_helper_name, which this generator does not"
-            ),
+            Instruction::LiftNamedFromMemory { ty, offset } => {
+                let name = self
+                    .lift_helper_name(self.interface_gen.resolve, *ty)
+                    .expect("lift helper must be registered before it is emitted");
+                results.push(format!(
+                    "{name}(({}) + {offset})",
+                    operands[0],
+                    offset = offset.size_wasm32()
+                ));
+            }
 
             Instruction::LowerNamedToMemory { ty, offset } => {
                 let name = self
@@ -3142,6 +3470,10 @@ impl Bindgen for FunctionBindgen<'_, '_> {
             element,
             Type::U8 | Type::U32 | Type::U64 | Type::S32 | Type::S64 | Type::F32 | Type::F64
         )
+    }
+
+    fn lift_helper_name(&self, _resolve: &Resolve, id: TypeId) -> Option<String> {
+        self.interface_gen.lift_helpers.get(&id).cloned()
     }
 
     fn lower_helper_name(&self, _resolve: &Resolve, id: TypeId) -> Option<String> {
@@ -3841,6 +4173,52 @@ mod tests {
     }
 
     #[test]
+    fn export_lower_helpers_are_shared_across_interfaces() {
+        let files = generate(
+            r#"
+            package test:shared-lowering;
+
+            interface types {
+                record shared {
+                    name: string,
+                    values: list<u32>,
+                }
+            }
+
+            interface first {
+                use types.{shared};
+                get-first: func(value: list<shared>) -> shared;
+            }
+
+            interface second {
+                use types.{shared};
+                get-second: func(value: list<shared>) -> shared;
+            }
+
+            world service {
+                import types;
+                export first;
+                export second;
+            }
+            "#,
+            "service",
+        );
+
+        let shared = file(&files, "gen/wit_bindgen_export_lower/ffi.mbt");
+        assert_eq!(shared.matches("pub fn wit_bindgen_lower_t").count(), 1);
+        assert_eq!(shared.matches("pub fn wit_bindgen_lift_t").count(), 1);
+
+        let first = file(&files, "gen/interface/test/shared-lowering/first/ffi.mbt");
+        let second = file(&files, "gen/interface/test/shared-lowering/second/ffi.mbt");
+        for wrapper in [first, second] {
+            assert!(wrapper.contains("@wit_bindgen_export_lower.wit_bindgen_lower_t"));
+            assert!(wrapper.contains("@wit_bindgen_export_lower.wit_bindgen_lift_t"));
+            assert!(!wrapper.contains("fn __wit_bindgen_lower_t"));
+            assert!(!wrapper.contains("fn __wit_bindgen_lift_t"));
+        }
+    }
+
+    #[test]
     fn async_export_surface_hides_component_model_bridge_types() {
         let files = generate(
             r#"
@@ -4257,7 +4635,11 @@ mod tests {
         );
         let ffi = file(&files, "interface/wasi/filesystem/types/ffi.mbt");
         assert_eq!(ffi.matches("write_window_size=65536").count(), 2);
-        assert_eq!(ffi.matches("let data_len = if data.length() < 65536").count(), 2);
+        assert_eq!(
+            ffi.matches("let data_len = if data.length() < 65536")
+                .count(),
+            2
+        );
         assert_eq!(ffi.matches("write_window_size=64").count(), 1);
         assert!(ffi.contains("[async-lower][stream-write-0][method]descriptor.write-via-stream"));
         assert!(ffi.contains("ptr + total * 1"));
@@ -4266,8 +4648,12 @@ mod tests {
         let runtime = file(&files, "async-core/async_trait.mbt");
         for method in ["Sink::write(self", "Sink::write_bytes(self"] {
             let body = &runtime[runtime.find(method).unwrap()..];
-            let cap = body.find("let length = if data.length() < self.write_window_size").unwrap();
-            let copy = body.find("FixedArray::makei(length, i => data[i])").unwrap();
+            let cap = body
+                .find("let length = if data.length() < self.write_window_size")
+                .unwrap();
+            let copy = body
+                .find("FixedArray::makei(length, i => data[i])")
+                .unwrap();
             assert!(cap < copy);
         }
     }
