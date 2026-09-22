@@ -34,6 +34,9 @@ pub struct InterfaceGenerator<'a> {
     /// Generated source for the bodies of the helpers in `lift_helpers`,
     /// flushed into `src` once at the end of import generation.
     pub(super) lift_helper_bodies: Source,
+    /// Owned synchronous export-result lowering. Async task returns, borrowed
+    /// import arguments and payload vtables stay inline.
+    pub(super) lower_helpers: BTreeMap<TypeId, String>,
 }
 
 /// A description of the "mode" in which a type is printed.
@@ -151,6 +154,35 @@ impl<'i> InterfaceGenerator<'i> {
         let mut traits = BTreeMap::new();
         let mut funcs_to_export = Vec::new();
         let mut resources_to_drop = Vec::new();
+
+        let mut live = LiveTypes::default();
+        for func in funcs.clone() {
+            if self.r#gen.skip.contains(&func.name)
+                || self
+                    .r#gen
+                    .is_async(self.resolve, interface.map(|p| p.1), func, false)
+            {
+                continue;
+            }
+            if let Some(result) = &func.result {
+                live.add_type(self.resolve, result);
+            }
+        }
+        for id in live.iter() {
+            // Resource-containing aggregates may depend on caller-local handle
+            // state or exported resource type parameters. Outline only plain
+            // data; their resource-free children can still be shared.
+            if !self.info(id).has_resource
+                && matches!(
+                    self.resolve.types[id].kind,
+                    TypeDefKind::Record(_) | TypeDefKind::Variant(_)
+                )
+            {
+                self.lower_helpers
+                    .insert(id, format!("__wit_bindgen_lower_t{}", id.index()));
+            }
+        }
+        self.generate_lower_helper_bodies();
 
         traits.insert(None, ("Guest".to_string(), Vec::new()));
 
@@ -553,6 +585,38 @@ macro_rules! {macro_name} {{
                  {body}\n\
                  {expr}\n\
                  }}\n\
+                 }}"
+            );
+        }
+    }
+
+    fn generate_lower_helper_bodies(&mut self) {
+        let resolve = self.resolve;
+        let module = self.wasm_import_module;
+        for id in self.lower_helpers.keys().copied().collect::<Vec<_>>() {
+            let name = self.lower_helpers[&id].clone();
+            let value_ty = self.type_path(id, true);
+            let mut f = FunctionBindgen::new(self, Vec::new(), module, true, false);
+            f.outline_lowers = true;
+            abi::lower_to_memory_root(
+                resolve,
+                &mut f,
+                "ptr".into(),
+                "value".into(),
+                &Type::Id(id),
+                id,
+            );
+            assert!(!f.needs_cleanup_list);
+            assert!(f.handle_decls.is_empty());
+            assert!(f.import_return_pointer_area_size.is_empty());
+            let body = String::from(mem::take(&mut f.src));
+            uwriteln!(
+                self.src,
+                "#[doc(hidden)]
+                 #[allow(dead_code, unused_unsafe, clippy::all)]
+                 #[inline(never)]
+                 unsafe fn {name}(ptr: *mut u8, value: {value_ty}) {{
+                     unsafe {{ {body} }}
                  }}"
             );
         }
@@ -1354,6 +1418,9 @@ unsafe fn call_import(&mut self, _params: Self::ParamsLower, _results: *mut u8) 
         }
 
         let mut f = FunctionBindgen::new(self, params, self.wasm_import_module, false, false);
+        // Async task.return borrows its result buffers until the intrinsic
+        // returns; it must not call a helper that transfers ownership.
+        f.outline_lowers = !async_;
         let variant = if async_ {
             AbiVariant::GuestExportAsync
         } else {

@@ -382,6 +382,7 @@ impl RustWasm {
             needs_wit_map: false,
             lift_helpers: Default::default(),
             lift_helper_bodies: Default::default(),
+            lower_helpers: Default::default(),
         }
     }
 

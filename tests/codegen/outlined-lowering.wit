@@ -1,0 +1,33 @@
+package test:outlined-lowering;
+
+interface model {
+  record schema-type { name: string, children: list<u32> }
+  variant schema-type-body {
+    scalar(schema-type),
+    composite(list<schema-type>),
+    absent,
+  }
+  record schema-graph { root: u32, nodes: list<schema-type-body> }
+  record tool { version: string, schema: schema-graph, extra: option<schema-graph> }
+  record agent-type { name: string, tools: list<tool>, schema: schema-graph }
+}
+
+interface api {
+  use model.{schema-type, schema-type-body, schema-graph, tool, agent-type};
+  type tool-alias = tool;
+  discover: func() -> list<tool>;
+  get: func() -> result<tool-alias, string>;
+  get-later: async func() -> list<tool>;
+  agents: func() -> list<agent-type>;
+  roundtrip: func(value: agent-type) -> agent-type;
+  stream-tools: func() -> stream<tool>;
+  future-tool: func() -> future<tool>;
+  resource token;
+  record with-resource { value: tool, token: own<token> }
+  resource-result: func() -> with-resource;
+}
+
+world test {
+  import api;
+  export api;
+}

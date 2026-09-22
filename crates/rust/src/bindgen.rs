@@ -32,6 +32,8 @@ pub(super) struct FunctionBindgen<'a, 'b> {
     /// must not outline; it lifts inline instead. Such payload `lift` functions
     /// are already isolated single-value lifts, so this loses no benefit.
     pub(super) outline_lifts: bool,
+    /// Only enabled for owned export results and their shared helper bodies.
+    pub(super) outline_lowers: bool,
 }
 
 pub const POINTER_SIZE_EXPRESSION: &str = "::core::mem::size_of::<*const u8>()";
@@ -59,6 +61,7 @@ impl<'a, 'b> FunctionBindgen<'a, 'b> {
             always_owned,
             return_self,
             outline_lifts: true,
+            outline_lowers: false,
         }
     }
 
@@ -283,6 +286,13 @@ impl Bindgen for FunctionBindgen<'_, '_> {
             return None;
         }
         self.r#gen.lift_helpers.get(&id).cloned()
+    }
+
+    fn lower_helper_name(&self, _resolve: &Resolve, id: TypeId) -> Option<String> {
+        if !self.outline_lowers {
+            return None;
+        }
+        self.r#gen.lower_helpers.get(&id).cloned()
     }
 
     fn emit(
@@ -1208,10 +1218,18 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                 results.push(format!("result{tmp}"));
             }
 
-            Instruction::LowerNamedToMemory { .. } => unreachable!(
-                "LowerNamedToMemory is only emitted by generators that implement \
-                 Bindgen::lower_helper_name, which this generator does not"
-            ),
+            Instruction::LowerNamedToMemory { ty, offset } => {
+                let name = self
+                    .lower_helper_name(resolve, *ty)
+                    .expect("lower helper must be registered before it is emitted");
+                uwriteln!(
+                    self.src,
+                    "{name}({base}.add({offset}), {value});",
+                    base = operands[1],
+                    offset = offset.format_term(POINTER_SIZE_EXPRESSION, true),
+                    value = operands[0],
+                );
+            }
 
             Instruction::I32Store { offset } => {
                 self.push_str(&format!(
