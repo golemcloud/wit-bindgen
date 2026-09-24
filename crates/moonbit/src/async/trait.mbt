@@ -9,7 +9,7 @@ pub struct Sink[X] {
 }
 
 ///|
-let sink_write_window_size : Int = 64
+let default_sink_write_window_size : Int = 64
 
 ///|
 /// The write callback must either raise before consuming any value or return
@@ -22,10 +22,17 @@ pub fn[X] Sink::from_callbacks(
   close : async () -> Unit,
   is_open : () -> Bool,
   cleanup : ((X) -> Unit)?,
-  write_window_size? : Int = sink_write_window_size,
+  write_window_size : Int,
 ) -> Sink[X] {
   guard! write_window_size > 0
-  { write, close, is_open, has_cleanup: () => cleanup is Some(_), cleanup, write_window_size }
+  {
+    write,
+    close,
+    is_open,
+    has_cleanup: () => cleanup is Some(_),
+    cleanup,
+    write_window_size,
+  }
 }
 
 ///|
@@ -43,7 +50,7 @@ pub async fn[X] Sink::write(self : Sink[X], data : ArrayView[X]) -> Int {
     self.write_window_size
   }
   // The callback may suspend, so it must not retain the caller's borrowed view.
-  let buffer = FixedArray::makei(length, i => data[i])
+  let buffer = FixedArray::from_array(data[:length])
   let written = (self.write)(buffer[:])
   guard! written >= 0 && written <= length
   if !(self.is_open)() && written < length && (self.has_cleanup)() {
@@ -68,7 +75,7 @@ pub async fn Sink::write_bytes(self : Sink[Byte], data : BytesView) -> Int {
   } else {
     self.write_window_size
   }
-  let buffer = FixedArray::makei(length, i => data[i])
+  let buffer = data[:length].to_fixedarray()
   let written = (self.write)(buffer[:])
   guard! written >= 0 && written <= length
   if !(self.is_open)() && written < length && (self.has_cleanup)() {
@@ -128,9 +135,7 @@ pub async fn[X] Sink::write_all(self : Sink[X], data : ArrayView[X]) -> Bool {
       return true
     }
     let written = {
-      errdefer {
-        self.cleanup_unaccepted(data, offset)
-      }
+      errdefer self.cleanup_unaccepted(data, offset)
       self.write(data[offset:])
     }
     offset = offset + written
@@ -151,9 +156,7 @@ pub async fn Sink::write_all_bytes(self : Sink[Byte], data : BytesView) -> Bool 
       return true
     }
     let written = {
-      errdefer {
-        self.cleanup_unaccepted_bytes(data, offset)
-      }
+      errdefer self.cleanup_unaccepted_bytes(data, offset)
       self.write_bytes(data[offset:])
     }
     offset = offset + written
@@ -214,7 +217,7 @@ fn[X] local_future_get(state : Ref[LocalFutureState[X]]) -> X raise {
       state.val.closed = true
       value
     }
-    None => raise Cancelled::Cancelled
+    None => raise FutureReadError::Dropped
   }
 }
 
@@ -317,7 +320,7 @@ fn[X] fill_stream_pipe_from_writers(pipe : Ref[StreamPipe[X]]) -> Unit {
     guard take_stream_pipe_writer(pipe) is Some(writer) else { return }
     guard writer.value is Some(data) else { continue }
     let take = if available < data.length() { available } else { data.length() }
-    let chunk = FixedArray::makei(take, i => data[i])
+    let chunk = FixedArray::from_array(data[:take])
     pipe.val.chunks.push_back(chunk)
     pipe.val.buffered = pipe.val.buffered + take
     wake_stream_pipe_writer(writer, take)
@@ -418,7 +421,7 @@ async fn[X] stream_pipe_write(
       } else {
         data.length()
       }
-      let chunk = FixedArray::makei(take, i => data[i])
+      let chunk = FixedArray::from_array(data[:take])
       wake_stream_pipe_reader(reader, Some(chunk), false)
       return take
     }
@@ -427,23 +430,24 @@ async fn[X] stream_pipe_write(
   if pipe.val.capacity > 0 && pipe.val.buffered < pipe.val.capacity {
     let available = pipe.val.capacity - pipe.val.buffered
     let take = if available < data.length() { available } else { data.length() }
-    let chunk = FixedArray::makei(take, i => data[i])
+    let chunk = FixedArray::from_array(data[:take])
     pipe.val.chunks.push_back(chunk)
     pipe.val.buffered = pipe.val.buffered + take
     return take
   }
   let writer = StreamPipeWriter::{
-    value: Some(FixedArray::makei(data.length(), i => data[i])),
+    value: Some(FixedArray::from_array(data)),
     accepted: 0,
     coro: Some(current_coroutine()),
   }
   pipe.val.writers.push_back(writer)
-  suspend() catch {
-    _ if writer.coro is None => return writer.accepted
-    err => {
+  match suspend_check_cancel() {
+    Continue => ()
+    Cancelled if writer.coro is None => return writer.accepted
+    Cancelled => {
       writer.coro = None
       writer.value = None
-      raise err
+      raise_cancellation_signal()
     }
   }
   writer.value = None
@@ -466,7 +470,9 @@ async fn[X] stream_pipe_read(
       Some(head) => {
         let available = head.length() - pipe.val.head_pos
         let take = if count < available { count } else { available }
-        let result = FixedArray::makei(take, i => head[pipe.val.head_pos + i])
+        let result = FixedArray::from_array(
+          head[pipe.val.head_pos:pipe.val.head_pos + take],
+        )
         pipe.val.head_pos = pipe.val.head_pos + take
         pipe.val.buffered = pipe.val.buffered - take
         if pipe.val.head_pos >= head.length() {
@@ -487,7 +493,7 @@ async fn[X] stream_pipe_read(
       Some(writer) => {
         guard writer.value is Some(data) else { continue }
         let take = if count < data.length() { count } else { data.length() }
-        let result = FixedArray::makei(take, i => data[i])
+        let result = FixedArray::from_array(data[:take])
         wake_stream_pipe_writer(writer, take)
         return Some(result)
       }
@@ -503,14 +509,12 @@ async fn[X] stream_pipe_read(
       coro: Some(current_coroutine()),
     }
     pipe.val.readers.push_back(reader)
-    suspend() catch {
-      err => {
-        reader.coro = None
-        match reader.value {
-          Some(value) => return Some(value)
-          None if reader.ended => return None
-          None => raise err
-        }
+    if suspend_check_cancel() is Cancelled {
+      reader.coro = None
+      match reader.value {
+        Some(value) => return Some(value)
+        None if reader.ended => return None
+        None => raise_cancellation_signal()
       }
     }
     match reader.value {
@@ -605,7 +609,7 @@ pub async fn[X] Future::get(self : Future[X]) -> X {
           state.val.on_unstarted_drop = None
           producer()
         }
-        None => raise Cancelled::Cancelled
+        None => raise FutureReadError::Dropped
       }
     Promised(cell) => promised_future_get(cell)
   }
@@ -737,13 +741,13 @@ fn[X] stream_pipe_sink(pipe : Ref[StreamPipe[X]]) -> Sink[X] {
     close: () => stream_pipe_close_writer(pipe),
     is_open: () => !pipe.val.writer_closed && !pipe.val.reader_dropped,
     has_cleanup: () => pipe.val.cleanup is Some(_),
-    write_window_size: sink_write_window_size,
     cleanup: Some(fn(value) {
       match pipe.val.cleanup {
         Some(cleanup) => cleanup(value)
         None => ()
       }
     }),
+    write_window_size: default_sink_write_window_size,
   }
 }
 
@@ -783,11 +787,7 @@ fn[X] materialize_stream_producer(
           state.val.on_unstarted_drop = None
           let sink = stream_pipe_sink(pipe)
           spawn_stream_producer(async fn() {
-            defer {
-              sink.close() catch {
-                _ => ()
-              }
-            }
+            defer stream_pipe_close_writer(pipe)
             producer(sink)
           })
         }

@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use wit_bindgen_core::abi::{Bitcast, WasmType};
 use wit_bindgen_core::{
-    AsyncFilterSet, Files, InterfaceGenerator as _, Source, Types, WorldGenerator, dealias,
-    name_package_module, uwrite, uwriteln, wit_parser::*,
+    AsyncFilterSet, ChainableMethodFilterSet, Files, InterfaceGenerator as _, Source, Types,
+    WorldGenerator, dealias, name_package_module, uwrite, uwriteln, wit_parser::*,
 };
 
 mod bindgen;
@@ -42,6 +42,8 @@ pub struct RustWasm {
     // Track which interfaces and types are generated. Remapped interfaces and types provided via `with`
     // are required to be used.
     generated_types: HashSet<String>,
+    used_type_attr_selectors: HashSet<String>,
+    used_member_attr_selectors: HashSet<String>,
     world: Option<WorldId>,
 
     rt_module: IndexSet<RuntimeItem>,
@@ -139,6 +141,17 @@ fn parse_with(s: &str) -> Result<(String, WithOption), String> {
     Ok((k.to_string(), v))
 }
 
+#[cfg(feature = "clap")]
+fn parse_attribute(s: &str) -> Result<(String, String), String> {
+    let (selector, attribute) = s
+        .split_once('=')
+        .ok_or_else(|| format!("expected string of form `<selector>=<attribute>`; got `{s}`"))?;
+    if attribute.trim().is_empty() {
+        return Err(format!("attribute must not be empty; got `{s}`"));
+    }
+    Ok((selector.to_string(), attribute.to_string()))
+}
+
 #[derive(Default, Debug, Clone)]
 #[cfg_attr(feature = "clap", derive(clap::Parser))]
 #[cfg_attr(
@@ -234,6 +247,12 @@ pub struct Opts {
     #[cfg_attr(feature = "clap", arg(long, value_name = "NAME"))]
     pub additional_derive_ignore: Vec<String>,
 
+    #[cfg_attr(feature = "clap", arg(long, value_parser = parse_attribute))]
+    pub additional_type_attributes: Vec<(String, String)>,
+
+    #[cfg_attr(feature = "clap", arg(long, value_parser = parse_attribute))]
+    pub additional_member_attributes: Vec<(String, String)>,
+
     /// Remapping of wit import interface and type names to Rust module names
     /// and types.
     ///
@@ -304,6 +323,10 @@ pub struct Opts {
     /// If true, methods normally returning `()` instead return `&Self`. This applies to both imported and exported methods.
     #[cfg_attr(feature = "clap", arg(long))]
     pub enable_method_chaining: bool,
+
+    #[cfg_attr(feature = "clap", clap(flatten))]
+    #[cfg_attr(feature = "serde", serde(flatten))]
+    pub chainable_methods: ChainableMethodFilterSet,
 }
 
 impl Opts {
@@ -366,7 +389,7 @@ impl RustWasm {
         in_import: bool,
     ) -> InterfaceGenerator<'a> {
         let mut sizes = SizeAlign::default();
-        sizes.fill(resolve);
+        sizes.fill(resolve).unwrap();
 
         InterfaceGenerator {
             identifier,
@@ -1065,12 +1088,6 @@ macro_rules! __export_{world_name}_impl {{
             .async_
             .is_async(resolve, interface, func, is_import)
     }
-
-    fn should_return_self(&self, func: &Function) -> bool {
-        self.opts.enable_method_chaining
-            && func.result.is_none()
-            && matches!(&func.kind, FunctionKind::Method(_))
-    }
 }
 
 impl WorldGenerator for RustWasm {
@@ -1307,7 +1324,7 @@ impl WorldGenerator for RustWasm {
         world: WorldId,
         funcs: &[(&str, &Function)],
         _files: &mut Files,
-    ) {
+    ) -> Result<()> {
         self.import_funcs_called = true;
 
         let mut r#gen = self.interface(Identifier::World(world), "$root", resolve, true);
@@ -1316,6 +1333,7 @@ impl WorldGenerator for RustWasm {
 
         let src = r#gen.finish();
         self.src.push_str(&src);
+        Ok(())
     }
 
     fn export_interface(
@@ -1401,7 +1419,7 @@ impl WorldGenerator for RustWasm {
         world: WorldId,
         types: &[(&str, TypeId)],
         _files: &mut Files,
-    ) {
+    ) -> Result<()> {
         let mut to_define = Vec::new();
         for (name, ty_id) in types {
             let full_name = full_wit_type_name(resolve, *ty_id);
@@ -1421,15 +1439,22 @@ impl WorldGenerator for RustWasm {
         }
         let src = r#gen.finish();
         self.src.push_str(&src);
+        Ok(())
     }
 
-    fn finish_imports(&mut self, resolve: &Resolve, world: WorldId, files: &mut Files) {
+    fn finish_imports(
+        &mut self,
+        resolve: &Resolve,
+        world: WorldId,
+        files: &mut Files,
+    ) -> Result<()> {
         if !self.import_funcs_called {
             // We call `import_funcs` even if the world doesn't import any
             // functions since one of the side effects of that method is to
             // generate `struct`s for any imported resources.
-            self.import_funcs(resolve, world, &[], files);
+            self.import_funcs(resolve, world, &[], files)?;
         }
+        Ok(())
     }
 
     fn finish(&mut self, resolve: &Resolve, world: WorldId, files: &mut Files) -> Result<()> {
