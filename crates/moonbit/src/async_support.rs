@@ -2592,6 +2592,14 @@ impl<'a, 'b> FunctionBindgen<'a, 'b> {
     }
 
     pub(super) fn capture_task_return(&mut self, params: &[WasmType], operands: &[String]) {
+        // Flat results can allocate outside a variant/list element block, so
+        // finish_block has not yet added their outer buffers to this list.
+        if !self.cleanup.is_empty() {
+            self.needs_cleanup_list = true;
+            for cleanup in mem::take(&mut self.cleanup) {
+                uwriteln!(self.src, "cleanup_list.push({})", cleanup.address);
+            }
+        }
         let (body, needs_cleanup_list, return_param, return_value) =
             match &mut self.async_state.task_return {
                 AsyncTaskReturnState::Generating {

@@ -967,56 +967,80 @@ impl InterfaceGenerator<'_> {
             let name = self.lower_helpers[&id].clone();
             let ty = Type::Id(id);
             let value_ty = self.world_gen.pkg_resolver.type_name(package, &ty);
-
-            // The helper body is generated in a borrow scope so that
-            // `FunctionBindgen`'s borrow of `self` ends before we write the
-            // finished body into `self.ffi` below.
-            let body = {
-                // Reserve the helper's parameter names (`ptr`, `value`) in the
-                // local namespace so that lowering temps such as the string /
-                // canonical-list pointer (`locals.tmp("ptr")`) become `ptr0`,
-                // `ptr1`, ... instead of `ptr`, which would shadow the `ptr`
-                // parameter and make subsequent `(ptr) + offset` stores write
-                // to the string's own buffer instead of the result base.
-                let mut f = FunctionBindgen::new_with_context(
-                    self,
-                    Box::new(["ptr".to_string(), "value".to_string()]),
-                    package,
-                    package,
-                );
-                abi::lower_to_memory_root(
-                    resolve,
-                    &mut f,
-                    "ptr".to_string(),
-                    "value".to_string(),
-                    &ty,
-                    id,
-                    abi::Realloc::Export("cabi_realloc"),
-                );
-                let body = mem::take(&mut f.src);
-
-                // A pure lower-to-memory of a record/variant allocates the
-                // result buffers via `cabi_realloc` (handed off to the caller)
-                // and must not require any of the side state that `export`
-                // would otherwise flush into the surrounding function. Assert
-                // the assumption holds rather than silently emitting broken
-                // code if a future lower path starts depending on them.
-                assert!(
-                    !f.needs_cleanup_list,
-                    "outlined lower helper unexpectedly requires a cleanup list"
-                );
-                assert!(
-                    f.cleanup.is_empty(),
-                    "outlined lower helper unexpectedly produced cleanup entries"
-                );
-                body
-            };
-
             let visibility = if public { "pub " } else { "" };
-            uwriteln!(
-                output,
-                "\n#doc(hidden)\n{visibility}fn {name}(ptr : Int, value : {value_ty}) -> Unit {{\n{body}\n}}\n"
-            );
+
+            for borrowed in [false, true] {
+                // The helper body is generated in a borrow scope so that
+                // `FunctionBindgen`'s borrow of `self` ends before we write the
+                // finished body into `self.ffi` below.
+                let body = {
+                    // Reserve the helper's parameter names (`ptr`, `value`) in the
+                    // local namespace so that lowering temps such as the string /
+                    // canonical-list pointer (`locals.tmp("ptr")`) become `ptr0`,
+                    // `ptr1`, ... instead of `ptr`, which would shadow the `ptr`
+                    // parameter and make subsequent `(ptr) + offset` stores write
+                    // to the string's own buffer instead of the result base.
+                    let mut f = FunctionBindgen::new_with_context(
+                        self,
+                        Box::new([
+                            "ptr".to_string(),
+                            "value".to_string(),
+                            "cleanup_list".to_string(),
+                        ]),
+                        package,
+                        package,
+                    );
+                    f.borrowed_lower = borrowed;
+                    abi::lower_to_memory_root(
+                        resolve,
+                        &mut f,
+                        "ptr".to_string(),
+                        "value".to_string(),
+                        &ty,
+                        id,
+                        if borrowed {
+                            abi::Realloc::None
+                        } else {
+                            abi::Realloc::Export("cabi_realloc")
+                        },
+                    );
+                    if borrowed {
+                        for cleanup in mem::take(&mut f.cleanup) {
+                            uwriteln!(f.src, "cleanup_list.push({})", cleanup.address);
+                        }
+                    }
+                    let body = mem::take(&mut f.src);
+
+                    // A pure lower-to-memory of a record/variant allocates the
+                    // result buffers via `cabi_realloc` (handed off to the caller)
+                    // and must not require any of the side state that `export`
+                    // would otherwise flush into the surrounding function. Assert
+                    // the assumption holds rather than silently emitting broken
+                    // code if a future lower path starts depending on them.
+                    assert!(
+                        borrowed || !f.needs_cleanup_list,
+                        "outlined lower helper unexpectedly requires a cleanup list"
+                    );
+                    assert!(
+                        f.cleanup.is_empty(),
+                        "outlined lower helper unexpectedly produced cleanup entries"
+                    );
+                    body
+                };
+
+                let (name, cleanup) = if borrowed {
+                    (
+                        name.replace("wit_bindgen_lower_t", "wit_bindgen_borrow_lower_t"),
+                        ", cleanup_list : Array[Int]",
+                    )
+                } else {
+                    (name.clone(), "")
+                };
+                uwriteln!(
+                    output,
+                    "\n#doc(hidden)\n{visibility}fn {name}(ptr : Int, value : {value_ty}{cleanup}) -> Unit {{\n{body}\n}}\n"
+                );
+            }
 
             // The memory owner frees buffers after the caller has consumed the
             // result. Share the same type/package placement as owned lowering,
@@ -1251,13 +1275,10 @@ impl InterfaceGenerator<'_> {
         // Register shared lower-to-memory helpers for the named aggregate
         // types reached from this export's result so that the recursive lower
         // is outlined into per-type helpers instead of being inlined into the
-        // `wasmExport*` glue. Only memory-lowered results (return-pointer
-        // results) go through `write_to_memory`, so helpers are only needed
-        // there.
-        if sig.retptr {
-            if let Some(result) = &func.result {
-                self.register_lower_helpers(result);
-            }
+        // `wasmExport*` glue. Flat async results also contain memory-lowered
+        // list elements, despite not using a return pointer themselves.
+        if let Some(result) = &func.result {
+            self.register_lower_helpers(result);
         }
 
         let mut bindgen = FunctionBindgen::new(
@@ -1265,6 +1286,7 @@ impl InterfaceGenerator<'_> {
             (0..sig.params.len()).map(|i| format!("p{i}")).collect(),
         )
         .with_async_state(endpoint_plan.state());
+        bindgen.borrowed_lower = async_plan.is_async();
 
         abi::call(
             bindgen.interface_gen.resolve,
@@ -1982,6 +2004,7 @@ struct FunctionBindgen<'a, 'b> {
     sync_import_argument_types: Option<Vec<Type>>,
     async_state: AsyncFunctionState,
     outline_deallocations: bool,
+    borrowed_lower: bool,
 }
 
 impl<'a, 'b> FunctionBindgen<'a, 'b> {
@@ -2022,6 +2045,7 @@ impl<'a, 'b> FunctionBindgen<'a, 'b> {
             sync_import_argument_types: None,
             async_state: AsyncFunctionState::default(),
             outline_deallocations: false,
+            borrowed_lower: false,
         }
     }
 
@@ -2964,12 +2988,19 @@ impl Bindgen for FunctionBindgen<'_, '_> {
             }
 
             Instruction::LowerNamedToMemory { ty, offset } => {
-                let name = self
+                let mut name = self
                     .lower_helper_name(self.interface_gen.resolve, *ty)
                     .expect("lower helper must be registered before it is emitted");
+                let cleanup = if self.borrowed_lower {
+                    name = name.replace("wit_bindgen_lower_t", "wit_bindgen_borrow_lower_t");
+                    self.needs_cleanup_list = true;
+                    ", cleanup_list"
+                } else {
+                    ""
+                };
                 uwriteln!(
                     self.src,
-                    "{name}(({}) + {offset}, {})",
+                    "{name}(({}) + {offset}, {}{cleanup})",
                     operands[1],
                     operands[0],
                     offset = offset.size_wasm32()
@@ -3464,9 +3495,9 @@ impl Bindgen for FunctionBindgen<'_, '_> {
             "let {address} = mbt_ffi_malloc({})",
             size.size_wasm32(),
         );
-        // If the interface is an import, we need to track this for cleanup
-        // Otherwise, the caller is responsible for cleaning up in post_return
-        if self.interface_gen.direction == Direction::Import {
+        // Import scratch and async task.return areas are temporary. Only sync
+        // export return areas are transferred to post_return.
+        if self.interface_gen.direction == Direction::Import || self.borrowed_lower {
             self.cleanup.push(Cleanup {
                 address: address.clone(),
             });
@@ -4265,6 +4296,49 @@ mod tests {
             assert!(!wrapper.contains("fn __wit_bindgen_lower_t"));
             assert!(!wrapper.contains("fn __wit_bindgen_lift_t"));
         }
+    }
+
+    #[test]
+    fn async_only_results_share_helpers_and_keep_cleanup_in_task_return() {
+        let files = generate(
+            r#"
+            package test:async-lowering;
+            interface types {
+                record leaf { text: string, tags: list<string> }
+                record wide { a: leaf, b: leaf, c: leaf, d: leaf, e: leaf }
+            }
+            interface first {
+                use types.{leaf, wide};
+                get: async func() -> list<leaf>;
+                large: async func() -> wide;
+            }
+            interface second {
+                use types.{leaf};
+                get: async func() -> list<leaf>;
+            }
+            world service { import types; export first; export second; }
+            "#,
+            "service",
+        );
+        let shared = file(&files, "gen/wit_bindgen_export_lower/ffi.mbt");
+        assert_eq!(
+            shared.matches("pub fn wit_bindgen_borrow_lower_t").count(),
+            2
+        );
+        assert!(shared.contains("cleanup_list.push(ptr0)"));
+        assert!(shared.contains("cleanup_list.push(address)"));
+        for interface in ["first", "second"] {
+            let wrapper = file(
+                &files,
+                &format!("gen/interface/test/async-lowering/{interface}/ffi.mbt"),
+            );
+            assert!(wrapper.contains("@wit_bindgen_export_lower.wit_bindgen_borrow_lower_t"));
+            assert!(wrapper.contains("cleanup_list.push(address)"));
+            assert!(wrapper.contains("TaskReturn(address, (return_value).length())"));
+            assert!(wrapper.contains("cleanup_list.each(mbt_ffi_free)"));
+        }
+        let first = file(&files, "gen/interface/test/async-lowering/first/ffi.mbt");
+        assert!(first.contains("cleanup_list.push(return_area)"));
     }
 
     #[test]
