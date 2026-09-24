@@ -6,13 +6,12 @@ use crate::{
 };
 use anyhow::Result;
 use heck::*;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::mem;
 use wit_bindgen_core::abi::{self, AbiVariant, LiftLower};
 use wit_bindgen_core::{
-    AnonymousTypeGenerator, ChainingMode, Source, TypeInfo, dealias, uwrite, uwriteln,
-    wit_parser::*,
+    AnonymousTypeGenerator, Source, TypeInfo, dealias, uwrite, uwriteln, wit_parser::*,
 };
 
 pub struct InterfaceGenerator<'a> {
@@ -150,23 +149,6 @@ enum PayloadFor {
 }
 
 impl<'i> InterfaceGenerator<'i> {
-    fn should_return_self(&mut self, func: &Function) -> Option<ChainingMode> {
-        let interface = match self.identifier {
-            Identifier::Interface(_, key) => Some(key),
-            Identifier::World(_) | Identifier::StreamOrFuturePayload => None,
-        };
-        self.r#gen
-            .opts
-            .chainable_methods
-            .should_be_chainable(self.resolve, interface, func, self.in_import)
-            .or_else(|| {
-                (self.r#gen.opts.enable_method_chaining
-                    && func.result.is_none()
-                    && matches!(func.kind, FunctionKind::Method(_)))
-                .then_some(ChainingMode::Borrowing)
-            })
-    }
-
     pub(super) fn generate_exports<'a>(
         &mut self,
         interface: Option<(InterfaceId, &WorldKey)>,
@@ -267,7 +249,7 @@ impl<'i> InterfaceGenerator<'i> {
                 ..Default::default()
             };
             sig.update_for_func(&func);
-            self.print_signature(func, true, &sig, None);
+            self.print_signature(func, true, &sig);
             self.src.push_str(";\n");
             let trait_method = mem::replace(&mut self.src, prev);
             methods.push(trait_method);
@@ -604,7 +586,7 @@ macro_rules! {macro_name} {{
             let ret_ty = self.type_path(id, true);
             let ty = Type::Id(id);
 
-            let mut f = FunctionBindgen::new(self, Vec::new(), module, true, None);
+            let mut f = FunctionBindgen::new(self, Vec::new(), module, true, false);
             let expr = abi::lift_from_memory_root(resolve, &mut f, "ptr".to_string(), &ty, id);
             let body = String::from(mem::take(&mut f.src));
 
@@ -659,7 +641,7 @@ macro_rules! {macro_name} {{
             } else {
                 String::new()
             };
-            let mut f = FunctionBindgen::new(self, Vec::new(), module, true, None);
+            let mut f = FunctionBindgen::new(self, Vec::new(), module, true, false);
             f.outline_lowers = true;
             f.lower_cleanup = borrowed.then_some("cleanup_list");
             abi::lower_to_memory_root(
@@ -696,7 +678,7 @@ macro_rules! {macro_name} {{
         let module = self.wasm_import_module;
         for id in self.deallocate_helpers.keys().copied().collect::<Vec<_>>() {
             let name = self.deallocate_helpers[&id].clone();
-            let mut f = FunctionBindgen::new(self, Vec::new(), module, true, None);
+            let mut f = FunctionBindgen::new(self, Vec::new(), module, true, false);
             f.outline_deallocations = true;
             abi::deallocate_lists_from_memory_root(resolve, &mut f, "ptr".into(), id);
             let body = String::from(mem::take(&mut f.src));
@@ -1090,7 +1072,6 @@ pub mod vtable{ordinal} {{
         self.generate_payloads("", func, interface);
 
         let async_ = self.r#gen.is_async(self.resolve, interface, func, true);
-        let return_self = self.should_return_self(func);
         let mut sig = FnSig {
             async_,
             ..Default::default()
@@ -1103,24 +1084,14 @@ pub mod vtable{ordinal} {{
             sig.update_for_func(&func);
         }
         self.src.push_str("#[allow(unused_unsafe, clippy::all)]\n");
-        let params = self.print_signature(func, async_, &sig, return_self);
+        let params = self.print_signature(func, async_, &sig);
         self.src.push_str("{\n");
         self.src.push_str("unsafe {\n");
 
         if async_ {
-            self.generate_guest_import_body_async(
-                &self.wasm_import_module,
-                func,
-                params,
-                return_self,
-            );
+            self.generate_guest_import_body_async(&self.wasm_import_module, func, params);
         } else {
-            self.generate_guest_import_body_sync(
-                &self.wasm_import_module,
-                func,
-                params,
-                return_self,
-            );
+            self.generate_guest_import_body_sync(&self.wasm_import_module, func, params);
         }
 
         self.src.push_str("}\n");
@@ -1132,7 +1103,7 @@ pub mod vtable{ordinal} {{
     }
 
     fn lower_to_memory(&mut self, address: &str, value: &str, ty: &Type, module: &str) -> String {
-        let mut f = FunctionBindgen::new(self, Vec::new(), module, true, None);
+        let mut f = FunctionBindgen::new(self, Vec::new(), module, true, false);
         abi::lower_to_memory(f.r#gen.resolve, &mut f, address.into(), value.into(), ty);
         format!("unsafe {{ {} }}", String::from(f.src))
     }
@@ -1144,7 +1115,7 @@ pub mod vtable{ordinal} {{
         indirect: bool,
         module: &str,
     ) -> String {
-        let mut f = FunctionBindgen::new(self, Vec::new(), module, true, None);
+        let mut f = FunctionBindgen::new(self, Vec::new(), module, true, false);
         abi::deallocate_lists_in_types(f.r#gen.resolve, types, operands, indirect, &mut f);
         format!("unsafe {{ {} }}", String::from(f.src))
     }
@@ -1156,7 +1127,7 @@ pub mod vtable{ordinal} {{
         indirect: bool,
         module: &str,
     ) -> String {
-        let mut f = FunctionBindgen::new(self, Vec::new(), module, true, None);
+        let mut f = FunctionBindgen::new(self, Vec::new(), module, true, false);
         abi::deallocate_lists_and_own_in_types(f.r#gen.resolve, types, operands, indirect, &mut f);
         format!("unsafe {{ {} }}", String::from(f.src))
     }
@@ -1180,7 +1151,7 @@ pub mod vtable{ordinal} {{
         module: &str,
         outline_lifts: bool,
     ) -> String {
-        let mut f = FunctionBindgen::new(self, Vec::new(), module, true, None);
+        let mut f = FunctionBindgen::new(self, Vec::new(), module, true, false);
         f.outline_lifts = outline_lifts;
         let result = abi::lift_from_memory(f.r#gen.resolve, &mut f, address.into(), ty);
         format!("unsafe {{ {}\n{result} }}", String::from(f.src))
@@ -1191,9 +1162,14 @@ pub mod vtable{ordinal} {{
         module: &str,
         func: &Function,
         params: Vec<String>,
-        return_self: Option<ChainingMode>,
     ) {
-        let mut f = FunctionBindgen::new(self, params, module, false, return_self);
+        let mut f = FunctionBindgen::new(
+            self,
+            params,
+            module,
+            false,
+            self.r#gen.should_return_self(func),
+        );
         abi::call(
             f.r#gen.resolve,
             AbiVariant::GuestImport,
@@ -1234,7 +1210,6 @@ pub mod vtable{ordinal} {{
         module: &str,
         func: &Function,
         mut params: Vec<String>,
-        return_self: Option<ChainingMode>,
     ) {
         let param_tys = func
             .params
@@ -1263,7 +1238,6 @@ struct ParamsLower(
             self.src.push_str(wasm_type(*ty));
             self.src.push_str(", ");
         }
-        let return_self = return_self.is_some();
         uwriteln!(
             self.src,
             "
@@ -1418,7 +1392,7 @@ unsafe fn call_import(&mut self, _params: Self::ParamsLower, _results: *mut u8) 
             }
             lowers.push("ParamsLower(_ptr,)".to_string());
         } else {
-            let mut f = FunctionBindgen::new(self, Vec::new(), module, true, None);
+            let mut f = FunctionBindgen::new(self, Vec::new(), module, true, false);
             let mut results = Vec::new();
             for (i, Param { ty, .. }) in func.params.iter().enumerate() {
                 let name = format!("_lower{i}");
@@ -1466,7 +1440,11 @@ unsafe fn call_import(&mut self, _params: Self::ParamsLower, _results: *mut u8) 
             self.src,
             "_MySubtask {{ _unused: core::marker::PhantomData }}.call(({})).await{}",
             params.join(" "),
-            if return_self { ";\nself" } else { "" }
+            if self.r#gen.should_return_self(func) {
+                ";\nself"
+            } else {
+                ""
+            }
         );
     }
 
@@ -1508,7 +1486,7 @@ unsafe fn call_import(&mut self, _params: Self::ParamsLower, _results: *mut u8) 
             );
         }
 
-        let mut f = FunctionBindgen::new(self, params, self.wasm_import_module, false, None);
+        let mut f = FunctionBindgen::new(self, params, self.wasm_import_module, false, false);
         // Async task.return borrows its result buffers until the intrinsic
         // returns; it must not call a helper that transfers ownership.
         f.outline_lowers = true;
@@ -1582,7 +1560,7 @@ unsafe fn call_import(&mut self, _params: Self::ParamsLower, _results: *mut u8) 
             let params = self.print_post_return_sig(func);
             self.src.push_str("{ unsafe {\n");
 
-            let mut f = FunctionBindgen::new(self, params, self.wasm_import_module, false, None);
+            let mut f = FunctionBindgen::new(self, params, self.wasm_import_module, false, false);
             f.outline_deallocations = true;
             abi::post_return(f.r#gen.resolve, func, &mut f);
             let FunctionBindgen {
@@ -1770,7 +1748,7 @@ unsafe fn call_import(&mut self, _params: Self::ParamsLower, _results: *mut u8) 
             };
             sig.update_for_func(&func);
             self.src.push_str("#[allow(unused_variables)]\n");
-            self.print_signature(func, true, &sig, None);
+            self.print_signature(func, true, &sig);
             self.src.push_str("{ unreachable!() }\n");
         }
 
@@ -1828,14 +1806,8 @@ unsafe fn call_import(&mut self, _params: Self::ParamsLower, _results: *mut u8) 
         // }
     }
 
-    fn print_signature(
-        &mut self,
-        func: &Function,
-        params_owned: bool,
-        sig: &FnSig,
-        return_self: Option<ChainingMode>,
-    ) -> Vec<String> {
-        let params = self.print_docs_and_params(func, params_owned, sig, return_self);
+    fn print_signature(&mut self, func: &Function, params_owned: bool, sig: &FnSig) -> Vec<String> {
+        let params = self.print_docs_and_params(func, params_owned, sig);
         self.push_str(" -> ");
         if let FunctionKind::Constructor(resource_id) = &func.kind {
             match classify_constructor_return_type(&self.resolve, *resource_id, &func.result) {
@@ -1849,10 +1821,10 @@ unsafe fn call_import(&mut self, _params: Self::ParamsLower, _results: *mut u8) 
                 }
             }
         } else {
-            match return_self {
-                Some(ChainingMode::Owning) => self.push_str("Self"),
-                Some(ChainingMode::Borrowing) => self.push_str("&Self"),
-                None => self.print_result_type(&func.result),
+            if self.r#gen.should_return_self(func) {
+                self.push_str("&Self");
+            } else {
+                self.print_result_type(&func.result);
             }
         }
         params
@@ -1863,7 +1835,6 @@ unsafe fn call_import(&mut self, _params: Self::ParamsLower, _results: *mut u8) 
         func: &Function,
         params_owned: bool,
         sig: &FnSig,
-        return_self: Option<ChainingMode>,
     ) -> Vec<String> {
         self.rustdoc(&func.docs);
         self.rustdoc_params(&func.params, "Parameters");
@@ -1899,10 +1870,7 @@ unsafe fn call_import(&mut self, _params: Self::ParamsLower, _results: *mut u8) 
         }
         self.push_str("(");
         if let Some(arg) = &sig.self_arg {
-            match return_self {
-                Some(ChainingMode::Owning) => self.push_str("self"),
-                _ => self.push_str(arg),
-            }
+            self.push_str(arg);
             self.push_str(",");
         }
         let mut params = Vec::new();
@@ -1914,13 +1882,7 @@ unsafe fn call_import(&mut self, _params: Self::ParamsLower, _results: *mut u8) 
         ) in func.params.iter().enumerate()
         {
             if i == 0 && sig.self_is_first_param {
-                params.push(
-                    match return_self {
-                        Some(ChainingMode::Owning) => "&self",
-                        _ => "self",
-                    }
-                    .to_string(),
-                );
+                params.push("self".to_string());
                 continue;
             }
             let name = to_rust_ident(name);
@@ -2433,50 +2395,8 @@ unsafe fn call_import(&mut self, _params: Self::ParamsLower, _results: *mut u8) 
         result
     }
 
-    fn matching_attrs(
-        entries: &[(String, String)],
-        used: &mut HashSet<String>,
-        matches: impl Fn(&str) -> bool,
-    ) -> Vec<String> {
-        let mut attrs = indexmap::IndexSet::new();
-        for (selector, attr) in entries.iter().filter(|(selector, _)| matches(selector)) {
-            attrs.insert(attr.clone());
-            used.insert(selector.clone());
-        }
-        attrs.into_iter().collect()
-    }
-
-    fn additional_type_attrs(&mut self, type_name: &str) -> Vec<String> {
-        Self::matching_attrs(
-            &self.r#gen.opts.additional_type_attributes,
-            &mut self.r#gen.used_type_attr_selectors,
-            |selector| selector == type_name,
-        )
-    }
-
-    fn additional_member_attrs(&mut self, type_name: &str, member: &str) -> Vec<String> {
-        Self::matching_attrs(
-            &self.r#gen.opts.additional_member_attributes,
-            &mut self.r#gen.used_member_attr_selectors,
-            |selector| selector.rsplit_once('.') == Some((type_name, member)),
-        )
-    }
-
-    fn push_attrs(&mut self, attrs: &[String]) {
-        for attr in attrs {
-            uwriteln!(self.src, "{attr}");
-        }
-    }
-
     fn print_typedef_record(&mut self, id: TypeId, record: &Record, docs: &Docs) {
         let info = self.info(id);
-        let type_name = full_wit_type_name(self.resolve, id);
-        let injected_attrs = self.additional_type_attrs(&type_name);
-        let field_attrs = record
-            .fields
-            .iter()
-            .map(|field| self.additional_member_attrs(&type_name, &field.name))
-            .collect::<Vec<_>>();
         // We use a BTree set to make sure we don't have any duplicates and we have a stable order
         let additional_derives: BTreeSet<String> = self
             .r#gen
@@ -2487,7 +2407,6 @@ unsafe fn call_import(&mut self, _params: Self::ParamsLower, _results: *mut u8) 
             .collect();
         for (name, mode) in self.modes_of(id) {
             self.rustdoc(docs);
-            self.push_attrs(&injected_attrs);
             let mut derives = BTreeSet::new();
             if !self
                 .r#gen
@@ -2511,9 +2430,8 @@ unsafe fn call_import(&mut self, _params: Self::ParamsLower, _results: *mut u8) 
             self.push_str(&format!("pub struct {name}"));
             self.print_generics(mode.lifetime);
             self.push_str(" {\n");
-            for (field, attrs) in record.fields.iter().zip(&field_attrs) {
+            for field in record.fields.iter() {
                 self.rustdoc(&field.docs);
-                self.push_attrs(attrs);
                 self.push_str("pub ");
                 self.push_str(&to_rust_ident(&field.name));
                 self.push_str(": ");
@@ -2590,13 +2508,6 @@ unsafe fn call_import(&mut self, _params: Self::ParamsLower, _results: *mut u8) 
         Self: Sized,
     {
         let info = self.info(id);
-        let type_name = full_wit_type_name(self.resolve, id);
-        let injected_attrs = self.additional_type_attrs(&type_name);
-        let cases = cases.into_iter().collect::<Vec<_>>();
-        let case_attrs = cases
-            .iter()
-            .map(|(case_name, _, _)| self.additional_member_attrs(&type_name, case_name))
-            .collect::<Vec<_>>();
         // We use a BTree set to make sure we don't have any duplicates and have a stable order
         let additional_derives: BTreeSet<String> = self
             .r#gen
@@ -2607,7 +2518,6 @@ unsafe fn call_import(&mut self, _params: Self::ParamsLower, _results: *mut u8) 
             .collect();
         for (name, mode) in self.modes_of(id) {
             self.rustdoc(docs);
-            self.push_attrs(&injected_attrs);
             let mut derives = BTreeSet::new();
             if !self
                 .r#gen
@@ -2630,9 +2540,8 @@ unsafe fn call_import(&mut self, _params: Self::ParamsLower, _results: *mut u8) 
             self.push_str(&format!("pub enum {name}"));
             self.print_generics(mode.lifetime);
             self.push_str(" {\n");
-            for ((case_name, docs, payload), attrs) in cases.clone().into_iter().zip(&case_attrs) {
+            for (case_name, docs, payload) in cases.clone() {
                 self.rustdoc(docs);
-                self.push_attrs(attrs);
                 self.push_str(&case_name);
                 if let Some(ty) = payload {
                     self.push_str("(");
@@ -2756,14 +2665,11 @@ unsafe fn call_import(&mut self, _params: Self::ParamsLower, _results: *mut u8) 
     {
         let info = self.info(id);
 
-        let type_name = full_wit_type_name(self.resolve, id);
-        let injected_attrs = self.additional_type_attrs(&type_name);
         let name = to_upper_camel_case(name);
         self.rustdoc(docs);
         for attr in attrs {
             self.push_str(&format!("{attr}\n"));
         }
-        self.push_attrs(&injected_attrs);
         self.push_str("#[repr(");
         self.int_repr(enum_.tag());
         self.push_str(")]\n");
@@ -2788,8 +2694,6 @@ unsafe fn call_import(&mut self, _params: Self::ParamsLower, _results: *mut u8) 
         self.push_str(&format!("pub enum {name} {{\n"));
         for case in enum_.cases.iter() {
             self.rustdoc(&case.docs);
-            let case_attrs = self.additional_member_attrs(&type_name, &case.name);
-            self.push_attrs(&case_attrs);
             self.push_str(&case_attr(case));
             self.push_str(&case.name.to_upper_camel_case());
             self.push_str(",\n");

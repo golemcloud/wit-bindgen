@@ -73,19 +73,19 @@ func Run() {
 			test.MakeZ3B(),
 			test.MakeZ4B(),
 		})
-		assertEqual(a.Tag(), test.Z1_B)
-		assertEqual(b.Tag(), test.Z2_B)
-		assertEqual(c.Tag(), test.Z3_B)
-		assertEqual(d.Tag(), test.Z4_B)
+		assertEqual(a.Tag(), test.Z1B)
+		assertEqual(b.Tag(), test.Z2B)
+		assertEqual(c.Tag(), test.Z3B)
+		assertEqual(d.Tag(), test.Z4B)
 	}
 
 	test.VariantTypedefs(None[uint32](), false, Err[uint32, Unit](Unit{}))
 
 	{
-		a, b, c := test.VariantEnums(true, Ok[Unit, Unit](Unit{}), test.MyErrno_Success)
+		a, b, c := test.VariantEnums(true, Ok[Unit, Unit](Unit{}), test.MyErrnoSuccess)
 		assertEqual(a, true)
 		b.Ok()
-		assertEqual(c, test.MyErrno_Success)
+		assertEqual(c, test.MyErrnoSuccess)
 	}
 }
 

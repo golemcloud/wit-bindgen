@@ -144,7 +144,6 @@ impl LanguageMethods for Csharp {
             .arg(&wasm_filename);
         runner.run_command(&mut cmd)?;
 
-        runner.run_command(dotnet().current_dir(&dir).arg("clean"))?;
-        Ok(())
+        runner.run_command(dotnet().current_dir(&dir).arg("clean"))
     }
 }

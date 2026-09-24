@@ -35,15 +35,14 @@ pub fn CondVar::CondVar() -> CondVar {
 
 ///|
 /// Wait until the condition variable is signaled.
-pub async fn CondVar::wait(self : CondVar) -> Unit noraise {
+pub async fn CondVar::wait(self : CondVar) -> Unit {
   let waiter = { woken: false, coro: Some(current_coroutine()) }
   self.waiters.push_back(waiter)
-  match suspend_check_cancel() {
-    Continue => ()
-    Cancelled if waiter.woken => ()
-    Cancelled => {
+  suspend() catch {
+    _ if waiter.woken => ()
+    err => {
       waiter.coro = None
-      raise_cancellation_signal()
+      raise err
     }
   }
 }

@@ -5,8 +5,5 @@
 
 ///|
 pub async fn run(_background_group : @async-core.TaskGroup[Unit]) -> Unit {
-  // Repeated exports exercise component-task state removal and recreation.
-  for _ in 0..<3 {
-    guard @operations.exercise() else { panic() }
-  }
+  guard @operations.exercise() else { panic() }
 }

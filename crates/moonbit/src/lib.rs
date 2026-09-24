@@ -367,7 +367,7 @@ impl WorldGenerator for MoonBit {
                 format!("{}/{}", package.namespace, package.name)
             }))
             .unwrap_or("generated".into());
-        self.sizes.fill(resolve)?;
+        self.sizes.fill(resolve);
 
         let mut groups: HashMap<String, Vec<(Option<WorldKey>, String)>> = HashMap::new();
         for (key, item) in &resolve.worlds[world].exports {
@@ -468,7 +468,7 @@ impl WorldGenerator for MoonBit {
         world: WorldId,
         funcs: &[(&str, &Function)],
         _files: &mut Files,
-    ) -> Result<()> {
+    ) {
         let name = PkgResolver::world_name(resolve, world);
         let mut r#gen = self.interface(resolve, &name, Direction::Import, None);
 
@@ -478,7 +478,6 @@ impl WorldGenerator for MoonBit {
 
         let result = r#gen.finish();
         self.import_world_fragment.concat(result);
-        Ok(())
     }
 
     fn import_types(
@@ -487,7 +486,7 @@ impl WorldGenerator for MoonBit {
         world: WorldId,
         types: &[(&str, TypeId)],
         _files: &mut Files,
-    ) -> Result<()> {
+    ) {
         let name = PkgResolver::world_name(resolve, world);
         let mut r#gen = self.interface(resolve, &name, Direction::Import, None);
 
@@ -497,15 +496,9 @@ impl WorldGenerator for MoonBit {
 
         let result = r#gen.finish();
         self.import_world_fragment.concat(result);
-        Ok(())
     }
 
-    fn finish_imports(
-        &mut self,
-        resolve: &Resolve,
-        world: WorldId,
-        files: &mut Files,
-    ) -> Result<()> {
+    fn finish_imports(&mut self, resolve: &Resolve, world: WorldId, files: &mut Files) {
         let name = PkgResolver::world_name(resolve, world);
         let directory = name.replace('.', "/");
 
@@ -542,7 +535,6 @@ impl WorldGenerator for MoonBit {
             false,
         );
         files.push(&format!("{directory}/moon.pkg.json"), moon_pkg.as_bytes());
-        Ok(())
     }
 
     fn export_interface(
@@ -1400,6 +1392,7 @@ impl InterfaceGenerator<'_> {
             self.interface,
             func,
             &camel_name,
+            &disambig,
             async_state,
         ) && abi::guest_export_needs_post_return(self.resolve, func)
         {
@@ -4501,7 +4494,9 @@ mod tests {
         assert!(ffi.contains("let close_writer_serialized = async fn()"));
         assert!(ffi.contains("writer_lock.acquire()"));
         assert!(ffi.contains("defer writer_lock.release()"));
-        assert!(ffi.contains("protect_from_cancel(() => close_writer_serialized())"));
+        assert!(
+            ffi.contains("() => close_writer_serialized(),\n            resume_on_cancel=true,")
+        );
         assert!(!ffi.contains("defer close_writer()"));
         assert!(ffi.contains("read_cleanup : @async-core.CondVar"));
         assert!(ffi.contains("let read_count = if count < 64"));
@@ -4669,25 +4664,32 @@ mod tests {
 
         let event_loop = file(&files, "async-core/async_ev.mbt");
         assert!(
-            event_loop.contains("abort(\"component task-owned coroutine failed after cleanup\")")
-                && event_loop.contains("begin_owned_failure_drain(task_state, coro)")
-                && event_loop.contains("task_state.owned_failure = true")
-                && event_loop.contains("task_state.task.cancel()")
-                && event_loop.contains("task_state.owned_coroutines.each(fn(coro)"),
+            event_loop.contains("abort(\"async export failed before task return\")")
+                && event_loop.contains("if !(ev.resolved.get(waitable_set) is Some(true))")
+                && event_loop
+                    .contains("abort(\"component task-owned coroutine failed after cleanup\")")
+                && event_loop
+                    .contains("Cancelled::Cancelled as err if is_being_cancelled() => raise err")
+                && event_loop.contains("begin_owned_failure_drain(waitable_set, coro)")
+                && event_loop.contains("ev.owned_failure.set(waitable_set, true)")
+                && event_loop.contains("root.cancel()")
+                && event_loop.contains("owned.each(fn(coro)")
+                && event_loop.contains("ev.cancellations.set(waitable_set, Requested)"),
             "{event_loop}"
         );
         let terminal = event_loop
-            .find("if task_state.task.state is (Done | Fail(_) | Cancelled)")
+            .find("if ev.finished.get(waitable_set) is Some(true) && no_more_work(waitable_set)")
             .unwrap();
         let terminal = &event_loop[terminal..];
         let snapshot = terminal.find("let owned_failed =").unwrap();
-        let finish = terminal
-            .find("finish_waitableset(waitable_set, task_state)")
-            .unwrap();
+        let finish = terminal.find("finish_waitableset(waitable_set)").unwrap();
         let abort = terminal
             .find("abort(\"component task-owned coroutine failed after cleanup\")")
             .unwrap();
         assert!(snapshot < finish && finish < abort, "{terminal}");
+        assert!(!event_loop.contains(
+            "if ev.owned_failure.get(waitable_set) is Some(true) {\n    finish_waitableset"
+        ));
     }
 
     #[test]
@@ -4707,8 +4709,9 @@ mod tests {
             "normal producer return must close the stream: {ffi}"
         );
         assert!(
-            async_trait
-                .contains("defer stream_pipe_close_writer(pipe)\n            producer(sink)"),
+            async_trait.contains(
+                "defer {\n              sink.close() catch {\n                _ => ()\n              }\n            }\n            producer(sink)"
+            ),
             "local producer cleanup must close without swallowing its outcome: {async_trait}"
         );
         assert!(
@@ -4718,10 +4721,14 @@ mod tests {
                 && !ffi.contains("run_producer() catch {"),
             "producer failure and cancellation must clean up and propagate: {ffi}"
         );
-        let reject = ffi.find("() => stream.reject(cleanup_value)").unwrap();
-        let close = ffi.find("() => close_writer_serialized()").unwrap();
-        let producer = ffi.find("run_producer()").unwrap();
-        assert!(close < reject && reject < producer, "{ffi}");
+        let failure = &ffi[ffi.find("errdefer {").unwrap()..];
+        let reject = failure.find("() => stream.reject(cleanup_value)").unwrap();
+        let close = failure.find("() => close_writer_serialized()").unwrap();
+        let producer = failure.find("run_producer()").unwrap();
+        assert!(
+            reject < close && close < producer,
+            "relay rejection and serialized close must guard producer failure: {failure}"
+        );
         assert!(
             ffi.contains("let mut total = 0")
                 && ffi.contains("while total < data_len")
@@ -4750,31 +4757,26 @@ mod tests {
             "service",
         );
         let ffi = file(&files, "interface/wasi/filesystem/types/ffi.mbt");
+        assert_eq!(ffi.matches("write_window_size=65536").count(), 2);
         assert_eq!(
             ffi.matches("let data_len = if data.length() < 65536")
                 .count(),
-            2,
-            "{ffi}"
+            2
         );
-        assert_eq!(
-            ffi.matches("let data_len = if data.length() < 8192")
-                .count(),
-            1
-        );
+        assert_eq!(ffi.matches("write_window_size=64").count(), 1);
         assert!(ffi.contains("[async-lower][stream-write-0][method]descriptor.write-via-stream"));
         assert!(ffi.contains("ptr + total * 1"));
         assert!(ffi.contains("data_len - total"));
 
         let runtime = file(&files, "async-core/async_trait.mbt");
-        for (method, copy_pattern) in [
-            ("Sink::write(self", "FixedArray::from_array(data[:length])"),
-            ("Sink::write_bytes(self", "data[:length].to_fixedarray()"),
-        ] {
+        for method in ["Sink::write(self", "Sink::write_bytes(self"] {
             let body = &runtime[runtime.find(method).unwrap()..];
             let cap = body
                 .find("let length = if data.length() < self.write_window_size")
                 .unwrap();
-            let copy = body.find(copy_pattern).unwrap();
+            let copy = body
+                .find("FixedArray::makei(length, i => data[i])")
+                .unwrap();
             assert!(cap < copy);
         }
     }

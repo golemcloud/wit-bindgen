@@ -97,7 +97,7 @@ type BoxFuture<'a> = Pin<Box<dyn Future<Output = ()> + 'a>>;
 #[cfg(feature = "async-spawn")]
 mod spawn;
 #[cfg(feature = "async-spawn")]
-pub use spawn::{JoinHandle, spawn_local};
+pub use spawn::spawn_local;
 #[cfg(not(feature = "async-spawn"))]
 mod spawn_disabled;
 #[cfg(not(feature = "async-spawn"))]
@@ -537,60 +537,6 @@ impl ReturnCode {
     }
 }
 
-#[cfg(not(target_env = "p3"))]
-mod task_state {
-    pub fn get() -> *mut u8 {
-        extern_wasm! {
-            #[link(wasm_import_module = "$root")]
-            unsafe extern "C" {
-                #[link_name = "[context-get-0]"]
-                fn get() -> *mut u8;
-            }
-        }
-
-        unsafe { get() }
-    }
-
-    pub unsafe fn set(value: *mut u8) {
-        extern_wasm! {
-            #[link(wasm_import_module = "$root")]
-            unsafe extern "C" {
-                #[link_name = "[context-set-0]"]
-                fn set(value: *mut u8);
-            }
-        }
-
-        unsafe { set(value) }
-    }
-}
-
-#[cfg(all(target_env = "p3", feature = "std"))]
-mod task_state {
-    std::thread_local!(static TASK_STATE: std::cell::Cell<*mut u8> = std::cell::Cell::new(std::ptr::null_mut()));
-
-    pub fn get() -> *mut u8 {
-        TASK_STATE.with(|c| c.get())
-    }
-
-    pub unsafe fn set(value: *mut u8) {
-        TASK_STATE.with(|c| c.set(value))
-    }
-}
-
-#[cfg(all(target_env = "p3", not(feature = "std")))]
-mod wasip3_context;
-#[cfg(all(target_env = "p3", not(feature = "std")))]
-mod task_state {
-
-    pub fn get() -> *mut u8 {
-        unsafe { super::wasip3_context::get() }
-    }
-
-    pub unsafe fn set(value: *mut u8) {
-        unsafe { super::wasip3_context::set(value) }
-    }
-}
-
 /// Starts execution of the `task` provided, an asynchronous computation.
 ///
 /// This is used for async-lifted exports at their definition site. The
@@ -611,8 +557,8 @@ pub fn start_task(task: impl Future<Output = ()> + 'static) -> i32 {
     // task, and then `callback` is only invoked when context-local storage is
     // valid.
     unsafe {
-        assert!(task_state::get().is_null());
-        task_state::set(state.cast());
+        assert!(context_get().is_null());
+        context_set(state.cast());
         callback(EVENT_NONE, 0, 0) as i32
     }
 }
@@ -628,10 +574,10 @@ pub unsafe fn callback(event0: u32, event1: u32, event2: u32) -> u32 {
     // Acquire our context-local state, assert it's not-null, and then reset
     // the state to null while we're running to help prevent any unintended
     // usage.
-    let state = task_state::get().cast::<TaskState<'static>>();
+    let state = context_get().cast::<TaskState<'static>>();
     assert!(!state.is_null());
     unsafe {
-        task_state::set(ptr::null_mut());
+        context_set(ptr::null_mut());
     }
 
     // Use `state` to run the `callback` function in the context of our event
@@ -643,7 +589,7 @@ pub unsafe fn callback(event0: u32, event1: u32, event2: u32) -> u32 {
         if rc == CallbackCode::Exit {
             drop(Box::from_raw(state));
         } else {
-            task_state::set(state.cast());
+            context_set(state.cast());
         }
         rtdebug!(" => (cb) {rc:?}");
         rc.encode()
@@ -654,7 +600,8 @@ pub unsafe fn callback(event0: u32, event1: u32, event2: u32) -> u32 {
 ///
 /// This uses `waitable-set.wait` to poll for progress on any in-progress calls
 /// to async-lowered imports as necessary.
-pub fn block_on<T>(future: impl Future<Output = T>) -> T {
+// TODO: refactor so `'static` bounds aren't necessary
+pub fn block_on<T: 'static>(future: impl Future<Output = T>) -> T {
     let mut result = None;
     let mut state = TaskState::new(Box::pin(async {
         result = Some(future.await);
@@ -774,6 +721,30 @@ pub fn backpressure_dec() {
     }
 
     unsafe { backpressure_dec() }
+}
+
+fn context_get() -> *mut u8 {
+    extern_wasm! {
+        #[link(wasm_import_module = "$root")]
+        unsafe extern "C" {
+            #[link_name = "[context-get-0]"]
+            fn get() -> *mut u8;
+        }
+    }
+
+    unsafe { get() }
+}
+
+unsafe fn context_set(value: *mut u8) {
+    extern_wasm! {
+        #[link(wasm_import_module = "$root")]
+        unsafe extern "C" {
+            #[link_name = "[context-set-0]"]
+            fn set(value: *mut u8);
+        }
+    }
+
+    unsafe { set(value) }
 }
 
 #[doc(hidden)]

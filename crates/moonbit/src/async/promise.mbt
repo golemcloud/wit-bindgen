@@ -43,10 +43,6 @@ pub struct Promise[X] {
 pub(all) suberror PromiseClosed derive(Debug)
 
 ///|
-#deprecated
-pub extend PromiseClosed with Debug::{to_repr}
-
-///|
 fn[X] new_future_promise(cleanup : ((X) -> Unit)?) -> (Future[X], Promise[X]) {
   let cell : Ref[PromiseCell[X]] = {
     val: {
@@ -144,7 +140,7 @@ fn[X] consume_promised_future(cell : Ref[PromiseCell[X]]) -> X raise {
       raise PromiseClosed
     }
     Pending => panic()
-    ReaderDropped => raise FutureReadError::Dropped
+    ReaderDropped => raise Cancelled::Cancelled
     Consumed => abort("future already consumed")
   }
 }
@@ -157,15 +153,13 @@ async fn[X] promised_future_get(cell : Ref[PromiseCell[X]]) -> X {
   match cell.val.state {
     Pending => {
       cell.val.reading = true
-      {
-        errdefer {
-          cell.val.reading = false
-          if cell.val.state is Pending {
-            cell.val.state = ReaderDropped
-          }
+      errdefer {
+        cell.val.reading = false
+        if cell.val.state is Pending {
+          cell.val.state = ReaderDropped
         }
-        cell.val.ready.acquire()
       }
+      cell.val.ready.acquire()
       cell.val.reading = false
       consume_promised_future(cell)
     }

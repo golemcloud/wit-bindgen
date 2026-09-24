@@ -1,8 +1,11 @@
 include!(env!("BINDINGS"));
 
-use crate::exports::test::moonbit_stream_write_cancel::holder::{Guest, GuestLeaf, Leaf};
-use std::sync::Mutex;
+use crate::exports::test::moonbit_stream_write_cancel::holder::{
+    Guest, GuestLeaf, Leaf,
+};
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Mutex;
 use std::task::Waker;
 use wit_bindgen::{StreamReader, StreamResult};
 
@@ -14,7 +17,10 @@ static WRITE_STARTED: AtomicBool = AtomicBool::new(false);
 static WRITE_STARTED_WAKER: Mutex<Option<Waker>> = Mutex::new(None);
 static LEAF_LIVE_COUNT: AtomicU32 = AtomicU32::new(0);
 static LEAF_DROP_COUNT: AtomicU32 = AtomicU32::new(0);
-static HELD_STREAM: Mutex<Option<StreamReader<Leaf>>> = Mutex::new(None);
+
+thread_local! {
+    static HELD_STREAM: RefCell<Option<StreamReader<Leaf>>> = const { RefCell::new(None) };
+}
 
 struct MyLeaf;
 
@@ -22,8 +28,7 @@ impl Guest for Component {
     type Leaf = MyLeaf;
 
     async fn hold(value: StreamReader<Leaf>) {
-        let prev = HELD_STREAM.lock().unwrap().replace(value);
-        assert!(prev.is_none());
+        HELD_STREAM.with(|stream| assert!(stream.borrow_mut().replace(value).is_none()));
     }
 
     fn mark_write_started() {
@@ -56,21 +61,20 @@ impl Guest for Component {
     }
 
     async fn writable_dropped() -> bool {
-        let mut stream = HELD_STREAM.lock().unwrap().take().unwrap();
+        let mut stream = HELD_STREAM.with(|stream| stream.borrow_mut().take().unwrap());
         let (result, values) = stream.read(Vec::with_capacity(1)).await;
         result == StreamResult::Dropped && values.is_empty()
     }
 
     async fn read_one_and_keep() -> bool {
-        let mut stream = HELD_STREAM.lock().unwrap().take().unwrap();
+        let mut stream = HELD_STREAM.with(|stream| stream.borrow_mut().take().unwrap());
         let (result, values) = stream.read(Vec::with_capacity(1)).await;
-        let prev = HELD_STREAM.lock().unwrap().replace(stream);
-        assert!(prev.is_none());
+        HELD_STREAM.with(|held| assert!(held.borrow_mut().replace(stream).is_none()));
         result == StreamResult::Complete(1) && values.len() == 1
     }
 
     async fn read_one_and_drop() -> bool {
-        let mut stream = HELD_STREAM.lock().unwrap().take().unwrap();
+        let mut stream = HELD_STREAM.with(|stream| stream.borrow_mut().take().unwrap());
         let (result, values) = stream.read(Vec::with_capacity(1)).await;
         result == StreamResult::Complete(1) && values.len() == 1
     }

@@ -1,5 +1,4 @@
 #include <assert.h>
-#include <cmath>
 #include <limits.h>
 #include <runner_cpp.h>
 

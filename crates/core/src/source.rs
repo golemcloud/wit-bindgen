@@ -49,16 +49,6 @@ impl Source {
     }
 
     pub fn push_str(&mut self, src: &str) {
-        self.push_str_impl(src, true);
-    }
-
-    /// Appends literal text with the current indentation without interpreting
-    /// braces or line comments as source syntax.
-    pub fn push_str_literal(&mut self, src: &str) {
-        self.push_str_impl(src, false);
-    }
-
-    fn push_str_impl(&mut self, src: &str, interpret_syntax: bool) {
         let lines = src.lines().collect::<Vec<_>>();
         for (i, line) in lines.iter().enumerate() {
             if !self.continuing_line {
@@ -71,11 +61,11 @@ impl Source {
             }
 
             let trimmed = line.trim();
-            if interpret_syntax && trimmed.starts_with("//") {
+            if trimmed.starts_with("//") {
                 self.in_line_comment = true;
             }
 
-            if interpret_syntax && !self.in_line_comment {
+            if !self.in_line_comment {
                 if trimmed.starts_with('}') && self.s.ends_with("  ") {
                     self.s.pop();
                     self.s.pop();
@@ -86,7 +76,7 @@ impl Source {
             } else {
                 line.trim_start()
             });
-            if interpret_syntax && !self.in_line_comment {
+            if !self.in_line_comment {
                 if trimmed.ends_with('{') {
                     self.indent += 1;
                 }
@@ -228,14 +218,5 @@ mod tests {
         }",
         );
         assert_eq!(s.s, "function() {\n  x\n}");
-    }
-
-    #[test]
-    fn literal_text_does_not_change_indentation() {
-        let mut s = Source::default();
-        s.indent(1);
-        s.push_str_literal("}\n{");
-        s.deindent(1);
-        assert_eq!(s.s, "  }\n  {");
     }
 }

@@ -37,24 +37,16 @@ impl LanguageMethods for Go {
         runner: &Runner,
         name: &str,
         config: &crate::config::WitConfig,
-        args: &[String],
+        _args: &[String],
     ) -> bool {
         if config.error_context {
             return true;
         }
-        if name.starts_with("named-fixed-length-list.wit") {
+        if name == "named-fixed-length-list.wit" {
             return true;
         }
         if !runner.go_async_supported() {
-            // The `--pkg-name` (library) verify path runs `go build ./...`
-            // with no link step, so the missing `runtime.wasiOnIdle` symbol
-            // never causes a failure and these tests compile fine even on an
-            // unpatched toolchain. Only the c-shared (non-pkg) path fails.
-            let pkg_mode = args.iter().any(|a| a == "--pkg-name");
-            if !pkg_mode {
-                return name.starts_with("async-trait-function.wit")
-                    || name.starts_with("issue-1598.wit");
-            }
+            return name == "async-trait-function.wit" || name == "issue-1598.wit";
         }
 
         false
@@ -83,15 +75,6 @@ impl LanguageMethods for Go {
 
     fn default_bindgen_args_for_codegen(&self) -> &[&str] {
         &["--generate-stubs"]
-    }
-
-    fn codegen_test_variants(&self) -> &[(&str, &[&str])] {
-        // Also run every codegen fixture through the `--pkg` library layout
-        // (imports/, exports/ subdirectories). `wit_component` matches the
-        // module name written by `replace_bindings_go_mod`, so the generated
-        // `wit_component/imports/...` and `wit_component/exports/...` import
-        // paths resolve against that go.mod.
-        &[("pkg-name", &["--pkg-name", "wit_component"])]
     }
 
     fn prepare(&self, runner: &mut Runner) -> Result<()> {
@@ -197,34 +180,17 @@ func main() {}
     fn verify(&self, runner: &Runner, verify: &Verify<'_>) -> Result<()> {
         replace_bindings_go_mod(runner, verify.bindings_dir)?;
 
-        // `go vet`
         runner.run_command(
             Command::new("go")
-                .current_dir(&verify.bindings_dir)
-                .arg("vet")
-                .arg("-unsafeptr=false")
-                .arg("./..."),
-        )?;
-
-        // `go build`. In `--pkg` (library) mode there is no main package in the
-        // bindings root, so `-buildmode=c-shared` on the current directory fails.
-        // Instead compile every subpackage with `./...`.
-        let pkg_mode = verify.args.iter().any(|a| a == "--pkg-name");
-        let mut cmd = Command::new("go");
-        cmd.current_dir(verify.bindings_dir)
-            .env("GOOS", "wasip1")
-            .env("GOARCH", "wasm")
-            .arg("build");
-        if pkg_mode {
-            cmd.arg("./...");
-        } else {
-            cmd.arg("-o")
+                .current_dir(verify.bindings_dir)
+                .env("GOOS", "wasip1")
+                .env("GOARCH", "wasm")
+                .arg("build")
+                .arg("-o")
                 .arg(verify.artifacts_dir.join("tmp.wasm"))
                 .arg("-buildmode=c-shared")
-                .arg("-ldflags=-checklinkname=0");
-        }
-        runner.run_command(&mut cmd)?;
-        Ok(())
+                .arg("-ldflags=-checklinkname=0"),
+        )
     }
 }
 

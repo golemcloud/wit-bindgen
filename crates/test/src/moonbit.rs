@@ -25,7 +25,12 @@ impl LanguageMethods for MoonBit {
     }
 
     fn default_bindgen_args(&self) -> &[&str] {
-        &["--derive-debug", "--derive-eq", "--derive-error"]
+        &[
+            "--derive-debug",
+            "--derive-show",
+            "--derive-eq",
+            "--derive-error",
+        ]
     }
 
     fn codegen_test_variants(&self) -> &[(&str, &[&str])] {

@@ -16,12 +16,8 @@
 priv enum TaskGroupState {
   Done
   Fail(Error)
-  Cancelled
   Running
 }
-
-///|
-priv struct GroupDeferBlock(async () -> Unit nocancel)
 
 ///|
 /// A `TaskGroup` can be used to spawn children tasks that run in parallel.
@@ -41,7 +37,7 @@ pub struct TaskGroup[X] {
   priv mut waiting : Int
   priv mut state : TaskGroupState
   priv mut result : X?
-  priv group_defer : Array[GroupDeferBlock]
+  priv group_defer : Array[async () -> Unit]
 }
 
 ///|
@@ -76,6 +72,7 @@ fn[X] TaskGroup::spawn_coroutine(
     }
     f() catch {
       err if allow_failure => raise err
+      Cancelled::Cancelled as err if is_being_cancelled() => raise err
       err => {
         if self.state is Running {
           for child in self.children {
@@ -112,8 +109,9 @@ fn[X] TaskGroup::spawn_coroutine(
 /// the whole task group will also fail if the spawned task fails,
 /// other tasks in the group will be cancelled in this case.
 ///
-/// Cancelled tasks are not considered failing. A normal error raised during
-/// cancellation cleanup is still considered a failure.
+/// Cancelled tasks are not considered failing, although they raise a
+/// cancellation error. A different error raised during cancellation is still
+/// considered a failure.
 ///
 /// A task spawned while the group is cancelling still starts, but begins in a
 /// cancelled state so its entry cleanup can run. Spawning after the group has
@@ -146,8 +144,9 @@ pub fn[X] TaskGroup::spawn_bg(
 /// the whole task group will also fail if the spawned task fails,
 /// other tasks in the group will be cancelled in this case.
 ///
-/// Cancelled tasks are not considered failing. A normal error raised during
-/// cancellation cleanup is still considered a failure.
+/// Cancelled tasks are not considered failing, although they raise a
+/// cancellation error. A different error raised during cancellation is still
+/// considered a failure.
 ///
 /// A task spawned while the group is cancelling still starts, but begins in a
 /// cancelled state so its entry cleanup can run. Spawning after the group has
@@ -177,18 +176,19 @@ pub fn[G, X] TaskGroup::spawn(
 /// Group scoped defer blocks are executed in FILO order, just like normal `defer`.
 /// `with_task_group` will only exit after all group defer blocks terminate.
 ///
-/// Group defer blocks must be `nocancel`. Use `protect_from_cancel` when
-/// running cancellable operations in a group defer.
+/// Note that if the whole task group is cancelled,
+/// async operations in group defer block will be cancelled immediately too.
+/// Users can use `protect_from_cancel` to prevent async tasks from being cancelled.
 /// It is highly recommended to add a hard timeout to async defer block in this case,
 /// to avoid infinite hanging due to blocked operation.
 pub fn[X] TaskGroup::add_defer(
   self : TaskGroup[X],
-  block : async () -> Unit nocancel,
+  block : async () -> Unit,
 ) -> Unit {
   guard self.state is Running else {
     abort("trying to attach defer to a terminated task group")
   }
-  self.group_defer.push(GroupDeferBlock(block))
+  self.group_defer.push(block)
 }
 
 ///|
@@ -220,17 +220,16 @@ pub async fn[X] with_task_group(f : async (TaskGroup[X]) -> X) -> X {
       tg.result = Some(value)
     }
   })
-  match suspend_check_cancel() {
-    Continue => ()
-    Cancelled => {
+  suspend() catch {
+    err => {
       if tg.state is Running {
-        tg.state = Cancelled
+        tg.state = Fail(err)
       }
       if !tg.children.is_empty() {
         for child in tg.children {
           child.cancel()
         }
-        protect_from_cancel(() => suspend())
+        protect_from_cancel(() => suspend(), resume_on_cancel=true)
       }
     }
   }
@@ -243,7 +242,6 @@ pub async fn[X] with_task_group(f : async (TaskGroup[X]) -> X) -> X {
   match tg.state {
     Done => tg.result.unwrap()
     Fail(err) => raise err
-    Cancelled => raise_cancellation_signal()
     Running => panic()
   }
 }
@@ -252,10 +250,10 @@ pub async fn[X] with_task_group(f : async (TaskGroup[X]) -> X) -> X {
 /// Force a task group to terminate immediately with the given result value.
 /// All child tasks in the group, including potentially the current one,
 /// will be cancelled.
-pub async fn[X] TaskGroup::return_immediately(
+pub fn[X] TaskGroup::return_immediately(
   self : TaskGroup[X],
   value : X,
-) -> Unit noraise {
+) -> Unit raise {
   if self.result is None {
     self.result = Some(value)
   }
@@ -265,5 +263,7 @@ pub async fn[X] TaskGroup::return_immediately(
       child.cancel()
     }
   }
-  check_cancellation()
+  if is_being_cancelled() {
+    raise Cancelled::Cancelled
+  }
 }

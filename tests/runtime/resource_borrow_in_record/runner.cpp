@@ -1,5 +1,4 @@
 #include <runner_cpp.h>
-#include <array>
 
 namespace test_imports = ::test::resource_borrow_in_record::to_test;
 #include <iostream>

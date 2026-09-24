@@ -27,7 +27,7 @@ pub fn Mutex::Mutex() -> Mutex {
 
 ///|
 /// Acquire the mutex in FIFO order.
-pub async fn Mutex::acquire(self : Mutex) -> Unit noraise {
+pub async fn Mutex::acquire(self : Mutex) -> Unit {
   self.semaphore.acquire()
 }
 

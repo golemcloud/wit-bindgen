@@ -66,18 +66,17 @@ pub fn Semaphore::release(self : Semaphore) -> Unit {
 
 ///|
 /// Acquire one permit, suspending in FIFO order when none is available.
-pub async fn Semaphore::acquire(self : Semaphore) -> Unit noraise {
+pub async fn Semaphore::acquire(self : Semaphore) -> Unit {
   if self.value > 0 {
     self.value -= 1
   } else {
     let waiter = { coro: Some(current_coroutine()), acquired: false }
     self.waiters.push_back(waiter)
-    match suspend_check_cancel() {
-      Continue => ()
-      Cancelled if waiter.acquired => ()
-      Cancelled => {
+    suspend() catch {
+      _ if waiter.acquired => ()
+      err => {
         waiter.coro = None
-        raise_cancellation_signal()
+        raise err
       }
     }
   }

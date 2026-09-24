@@ -16,7 +16,7 @@ func StringError(x float32) Result[float32, string] {
 
 func EnumError(x float32) Result[float32, E] {
 	if x == 0.0 {
-		return Err[float32, E](E_A)
+		return Err[float32, E](EA)
 	} else {
 		return Ok[float32, E](x)
 	}
@@ -36,9 +36,9 @@ func VariantError(x float32) Result[float32, E3] {
 	if x == 0.0 {
 		return Err[float32, E3](MakeE3E2(E2{420, 0}))
 	} else if x == 1.0 {
-		return Err[float32, E3](MakeE3E1(E_B))
+		return Err[float32, E3](MakeE3E1(EB))
 	} else if x == 2.0 {
-		return Err[float32, E3](MakeE3E1(E_C))
+		return Err[float32, E3](MakeE3E1(EC))
 	} else {
 		return Ok[float32, E3](x)
 	}
