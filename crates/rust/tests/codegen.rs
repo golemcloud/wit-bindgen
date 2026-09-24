@@ -234,6 +234,11 @@ mod owning_method_chaining {
         generate_all,
         chainable_methods: ["all"]
     });
+
+    #[test]
+    fn owning_chaining_returns_owned_resource() {
+        let _: fn(A, u32) -> A = A::set_a;
+    }
 }
 
 #[allow(unused, reason = "testing codegen, not functionality")]
@@ -253,6 +258,11 @@ mod borrowing_method_chaining {
         generate_all,
         chainable_methods: ["&all"]
     });
+
+    #[test]
+    fn borrowing_chaining_returns_borrowed_resource() {
+        let _: fn(&A, u32) -> &A = A::set_a;
+    }
 }
 
 #[allow(unused, reason = "testing codegen, not functionality")]

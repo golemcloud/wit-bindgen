@@ -267,7 +267,7 @@ impl<'i> InterfaceGenerator<'i> {
                 ..Default::default()
             };
             sig.update_for_func(&func);
-            self.print_signature(func, true, &sig);
+            self.print_signature(func, true, &sig, None);
             self.src.push_str(";\n");
             let trait_method = mem::replace(&mut self.src, prev);
             methods.push(trait_method);
@@ -1090,6 +1090,7 @@ pub mod vtable{ordinal} {{
         self.generate_payloads("", func, interface);
 
         let async_ = self.r#gen.is_async(self.resolve, interface, func, true);
+        let return_self = self.should_return_self(func);
         let mut sig = FnSig {
             async_,
             ..Default::default()
@@ -1102,14 +1103,24 @@ pub mod vtable{ordinal} {{
             sig.update_for_func(&func);
         }
         self.src.push_str("#[allow(unused_unsafe, clippy::all)]\n");
-        let params = self.print_signature(func, async_, &sig);
+        let params = self.print_signature(func, async_, &sig, return_self);
         self.src.push_str("{\n");
         self.src.push_str("unsafe {\n");
 
         if async_ {
-            self.generate_guest_import_body_async(&self.wasm_import_module, func, params);
+            self.generate_guest_import_body_async(
+                &self.wasm_import_module,
+                func,
+                params,
+                return_self,
+            );
         } else {
-            self.generate_guest_import_body_sync(&self.wasm_import_module, func, params);
+            self.generate_guest_import_body_sync(
+                &self.wasm_import_module,
+                func,
+                params,
+                return_self,
+            );
         }
 
         self.src.push_str("}\n");
@@ -1180,8 +1191,8 @@ pub mod vtable{ordinal} {{
         module: &str,
         func: &Function,
         params: Vec<String>,
+        return_self: Option<ChainingMode>,
     ) {
-        let return_self = self.should_return_self(func);
         let mut f = FunctionBindgen::new(self, params, module, false, return_self);
         abi::call(
             f.r#gen.resolve,
@@ -1223,6 +1234,7 @@ pub mod vtable{ordinal} {{
         module: &str,
         func: &Function,
         mut params: Vec<String>,
+        return_self: Option<ChainingMode>,
     ) {
         let param_tys = func
             .params
@@ -1251,7 +1263,7 @@ struct ParamsLower(
             self.src.push_str(wasm_type(*ty));
             self.src.push_str(", ");
         }
-        let return_self = self.should_return_self(func).is_some();
+        let return_self = return_self.is_some();
         uwriteln!(
             self.src,
             "
@@ -1758,7 +1770,7 @@ unsafe fn call_import(&mut self, _params: Self::ParamsLower, _results: *mut u8) 
             };
             sig.update_for_func(&func);
             self.src.push_str("#[allow(unused_variables)]\n");
-            self.print_signature(func, true, &sig);
+            self.print_signature(func, true, &sig, None);
             self.src.push_str("{ unreachable!() }\n");
         }
 
@@ -1816,8 +1828,14 @@ unsafe fn call_import(&mut self, _params: Self::ParamsLower, _results: *mut u8) 
         // }
     }
 
-    fn print_signature(&mut self, func: &Function, params_owned: bool, sig: &FnSig) -> Vec<String> {
-        let params = self.print_docs_and_params(func, params_owned, sig);
+    fn print_signature(
+        &mut self,
+        func: &Function,
+        params_owned: bool,
+        sig: &FnSig,
+        return_self: Option<ChainingMode>,
+    ) -> Vec<String> {
+        let params = self.print_docs_and_params(func, params_owned, sig, return_self);
         self.push_str(" -> ");
         if let FunctionKind::Constructor(resource_id) = &func.kind {
             match classify_constructor_return_type(&self.resolve, *resource_id, &func.result) {
@@ -1831,10 +1849,10 @@ unsafe fn call_import(&mut self, _params: Self::ParamsLower, _results: *mut u8) 
                 }
             }
         } else {
-            if self.should_return_self(func).is_some() {
-                self.push_str("&Self");
-            } else {
-                self.print_result_type(&func.result);
+            match return_self {
+                Some(ChainingMode::Owning) => self.push_str("Self"),
+                Some(ChainingMode::Borrowing) => self.push_str("&Self"),
+                None => self.print_result_type(&func.result),
             }
         }
         params
@@ -1845,6 +1863,7 @@ unsafe fn call_import(&mut self, _params: Self::ParamsLower, _results: *mut u8) 
         func: &Function,
         params_owned: bool,
         sig: &FnSig,
+        return_self: Option<ChainingMode>,
     ) -> Vec<String> {
         self.rustdoc(&func.docs);
         self.rustdoc_params(&func.params, "Parameters");
@@ -1880,7 +1899,10 @@ unsafe fn call_import(&mut self, _params: Self::ParamsLower, _results: *mut u8) 
         }
         self.push_str("(");
         if let Some(arg) = &sig.self_arg {
-            self.push_str(arg);
+            match return_self {
+                Some(ChainingMode::Owning) => self.push_str("self"),
+                _ => self.push_str(arg),
+            }
             self.push_str(",");
         }
         let mut params = Vec::new();
@@ -1892,7 +1914,13 @@ unsafe fn call_import(&mut self, _params: Self::ParamsLower, _results: *mut u8) 
         ) in func.params.iter().enumerate()
         {
             if i == 0 && sig.self_is_first_param {
-                params.push("self".to_string());
+                params.push(
+                    match return_self {
+                        Some(ChainingMode::Owning) => "&self",
+                        _ => "self",
+                    }
+                    .to_string(),
+                );
                 continue;
             }
             let name = to_rust_ident(name);
