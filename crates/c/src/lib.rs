@@ -3925,6 +3925,9 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                 "LiftNamedFromMemory is only emitted by generators that implement \
                  Bindgen::lift_helper_name, which this generator does not"
             ),
+            Instruction::DeallocateNamedFromMemory { .. } => {
+                unreachable!("cleanup outlining is disabled")
+            }
             Instruction::LowerNamedToMemory { .. } => unreachable!(
                 "LowerNamedToMemory is only emitted by generators that implement \
                  Bindgen::lower_helper_name, which this generator does not"

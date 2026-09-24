@@ -383,6 +383,8 @@ impl RustWasm {
             lift_helpers: Default::default(),
             lift_helper_bodies: Default::default(),
             lower_helpers: Default::default(),
+            borrowed_lower_helpers: Default::default(),
+            deallocate_helpers: Default::default(),
         }
     }
 

@@ -146,6 +146,10 @@ def_instruction! {
         /// operand is `operands[0]` and the base pointer is `operands[1]`.
         LowerNamedToMemory { ty: TypeId, offset: ArchitectureSize } : [2] => [0],
 
+        /// Frees the lists and strings in a canonical memory value. Handles
+        /// have already transferred to the caller and must not be dropped.
+        DeallocateNamedFromMemory { ty: TypeId, offset: ArchitectureSize } : [1] => [0],
+
         /// Pops a pointer from the stack and then an `i32` value.
         /// Stores the value in little-endian at the pointer specified plus the
         /// constant `offset`.
@@ -841,6 +845,13 @@ pub trait Bindgen {
         let _ = (resolve, id);
         None
     }
+
+    /// A shared memory cleanup helper which frees only lists and strings,
+    /// never owned handles. Not used by cancellation's lists-and-own cleanup.
+    fn deallocate_helper_name(&self, resolve: &Resolve, id: TypeId) -> Option<String> {
+        let _ = (resolve, id);
+        None
+    }
 }
 
 /// Generates an abstract sequence of instructions which represents this
@@ -957,6 +968,7 @@ pub fn lower_to_memory_root<B: Bindgen>(
     value: B::Operand,
     ty: &Type,
     skip_outline_root: TypeId,
+    realloc: Realloc,
 ) {
     assert!(
         matches!(ty, Type::Id(id) if *id == skip_outline_root),
@@ -964,7 +976,7 @@ pub fn lower_to_memory_root<B: Bindgen>(
          not an alias or other type"
     );
     let mut generator = Generator::new(resolve, bindgen);
-    generator.realloc = Some(Realloc::Export("cabi_realloc"));
+    generator.realloc = Some(realloc);
     generator.lower_outline_root = Some(skip_outline_root);
     generator.stack.push(value);
     generator.write_to_memory(ty, address, Default::default());
@@ -979,6 +991,24 @@ pub fn lower_to_memory_root<B: Bindgen>(
 /// plus others used as input to those instructions.
 pub fn post_return(resolve: &Resolve, func: &Function, bindgen: &mut impl Bindgen) {
     Generator::new(resolve, bindgen).post_return(func);
+}
+
+/// Generates a list-only cleanup helper, expanding its root once while allowing
+/// nested types to call their own helpers. Does not free the root allocation.
+pub fn deallocate_lists_from_memory_root<B: Bindgen>(
+    resolve: &Resolve,
+    bindgen: &mut B,
+    address: B::Operand,
+    id: TypeId,
+) {
+    let mut generator = Generator::new(resolve, bindgen);
+    generator.deallocate_outline_root = Some(id);
+    generator.deallocate_indirect(
+        &Type::Id(id),
+        address,
+        Default::default(),
+        Deallocate::Lists,
+    );
 }
 
 /// Returns whether the `Function` specified needs a post-return function to
@@ -1122,6 +1152,7 @@ struct Generator<'a, B: Bindgen> {
     /// type's id so its own top-level lower is inlined (one level) while
     /// nested named aggregates are still outlined. `None` everywhere else.
     lower_outline_root: Option<TypeId>,
+    deallocate_outline_root: Option<TypeId>,
 }
 
 const MAX_FLAT_PARAMS: usize = 16;
@@ -1139,6 +1170,7 @@ impl<'a, B: Bindgen> Generator<'a, B> {
             realloc: None,
             lift_outline_root: None,
             lower_outline_root: None,
+            deallocate_outline_root: None,
         }
     }
 
@@ -2661,6 +2693,21 @@ impl<'a, B: Bindgen> Generator<'a, B> {
         // require any form of post-return.
         if !needs_deallocate(self.resolve, ty, what) {
             return;
+        }
+
+        if let Type::Id(id) = *ty {
+            let is_root = self.deallocate_outline_root.take() == Some(id);
+            if !what.handles()
+                && !is_root
+                && self
+                    .bindgen
+                    .deallocate_helper_name(self.resolve, id)
+                    .is_some()
+            {
+                self.stack.push(addr);
+                self.emit(&DeallocateNamedFromMemory { ty: id, offset });
+                return;
+            }
         }
 
         match *ty {

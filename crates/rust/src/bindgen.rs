@@ -32,8 +32,10 @@ pub(super) struct FunctionBindgen<'a, 'b> {
     /// must not outline; it lifts inline instead. Such payload `lift` functions
     /// are already isolated single-value lifts, so this loses no benefit.
     pub(super) outline_lifts: bool,
-    /// Only enabled for owned export results and their shared helper bodies.
+    /// Enabled for export results and their shared helper bodies.
     pub(super) outline_lowers: bool,
+    pub(super) lower_cleanup: Option<&'static str>,
+    pub(super) outline_deallocations: bool,
 }
 
 pub const POINTER_SIZE_EXPRESSION: &str = "::core::mem::size_of::<*const u8>()";
@@ -62,11 +64,13 @@ impl<'a, 'b> FunctionBindgen<'a, 'b> {
             return_self,
             outline_lifts: true,
             outline_lowers: false,
+            lower_cleanup: None,
+            outline_deallocations: false,
         }
     }
 
     fn cleanup(&mut self, cleanup_value: &str) {
-        if self.block_storage.len() > 0 {
+        if self.block_storage.len() > 0 || self.lower_cleanup.is_some() {
             self.needs_cleanup_list = true;
             uwriteln!(self.src, "cleanup_list.extend({cleanup_value});");
         }
@@ -292,7 +296,17 @@ impl Bindgen for FunctionBindgen<'_, '_> {
         if !self.outline_lowers {
             return None;
         }
-        self.r#gen.lower_helpers.get(&id).cloned()
+        if self.lower_cleanup.is_some() {
+            self.r#gen.borrowed_lower_helpers.get(&id).cloned()
+        } else {
+            self.r#gen.lower_helpers.get(&id).cloned()
+        }
+    }
+
+    fn deallocate_helper_name(&self, _resolve: &Resolve, id: TypeId) -> Option<String> {
+        self.outline_deallocations
+            .then(|| self.r#gen.deallocate_helpers.get(&id).cloned())
+            .flatten()
     }
 
     fn emit(
@@ -1222,12 +1236,28 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                 let name = self
                     .lower_helper_name(resolve, *ty)
                     .expect("lower helper must be registered before it is emitted");
+                let cleanup = if let Some(cleanup) = self.lower_cleanup {
+                    self.needs_cleanup_list = true;
+                    format!(", {cleanup}")
+                } else {
+                    String::new()
+                };
                 uwriteln!(
                     self.src,
-                    "{name}({base}.add({offset}), {value});",
+                    "{name}({base}.add({offset}), {value}{cleanup});",
                     base = operands[1],
                     offset = offset.format_term(POINTER_SIZE_EXPRESSION, true),
                     value = operands[0],
+                );
+            }
+
+            Instruction::DeallocateNamedFromMemory { ty, offset } => {
+                let name = self.deallocate_helper_name(resolve, *ty).unwrap();
+                uwriteln!(
+                    self.src,
+                    "{name}({base}.add({offset}));",
+                    base = operands[0],
+                    offset = offset.format_term(POINTER_SIZE_EXPRESSION, true),
                 );
             }
 

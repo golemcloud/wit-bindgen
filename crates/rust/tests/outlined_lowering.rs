@@ -20,7 +20,13 @@ fn export_lower_helpers_are_shared_and_ownership_scoped() {
     .unwrap();
     let (_, source) = files.iter().next().unwrap();
     let source = std::str::from_utf8(source).unwrap();
-    assert_eq!(source.matches("unsafe fn __wit_bindgen_lower_").count(), 5);
+    assert_eq!(source.matches("unsafe fn __wit_bindgen_lower_").count(), 6);
+    assert_eq!(
+        source
+            .matches("unsafe fn __wit_bindgen_deallocate_")
+            .count(),
+        6
+    );
     let (imports, exports) = source.split_once("pub mod exports").unwrap();
     assert!(!imports.contains("__wit_bindgen_lower_"));
     assert!(exports.contains("#[inline(never)]"));
@@ -41,6 +47,7 @@ fn export_lower_helpers_are_shared_and_ownership_scoped() {
     ] {
         assert!(exports.contains(&format!("::{name})")), "{name}");
     }
+    assert!(exports.contains("value: WithResource)"));
     // Golden call sites: nested records and variant payloads must preserve
     // pointer-sized offsets, not overwrite their enclosing discriminants.
     assert!(

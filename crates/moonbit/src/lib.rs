@@ -789,31 +789,36 @@ impl InterfaceGenerator<'_> {
                 if self.lift_helpers.contains_key(&id) {
                     return;
                 }
-                let name = if self
-                    .world_gen
-                    .can_share_export_lower_helper(self.resolve, &Type::Id(id))
-                {
-                    let helper_name = format!("wit_bindgen_lift_t{}", id.index());
-                    if self
+                // Endpoint bridges carry function-specific intrinsic indices
+                // and cancellation state. Only their endpoint-free children
+                // can use context-free memory helpers.
+                if !type_contains_future_or_stream(self.resolve, ty) {
+                    let name = if self
                         .world_gen
-                        .export_lift_helpers
-                        .insert(id, helper_name.clone())
-                        .is_none()
+                        .can_share_export_lower_helper(self.resolve, &Type::Id(id))
                     {
-                        self.new_export_lift_helpers.insert(id);
-                    }
-                    let package = self.world_gen.export_lower_package();
-                    format!(
-                        "{}{}",
-                        self.world_gen
-                            .pkg_resolver
-                            .qualify_package(self.name, &package),
-                        helper_name
-                    )
-                } else {
-                    format!("__wit_bindgen_lift_t{}", id.index())
-                };
-                self.lift_helpers.insert(id, name);
+                        let helper_name = format!("wit_bindgen_lift_t{}", id.index());
+                        if self
+                            .world_gen
+                            .export_lift_helpers
+                            .insert(id, helper_name.clone())
+                            .is_none()
+                        {
+                            self.new_export_lift_helpers.insert(id);
+                        }
+                        let package = self.world_gen.export_lower_package();
+                        format!(
+                            "{}{}",
+                            self.world_gen
+                                .pkg_resolver
+                                .qualify_package(self.name, &package),
+                            helper_name
+                        )
+                    } else {
+                        format!("__wit_bindgen_lift_t{}", id.index())
+                    };
+                    self.lift_helpers.insert(id, name);
+                }
                 let children: Vec<Type> = match &self.resolve.types[id].kind {
                     TypeDefKind::Record(record) => {
                         record.fields.iter().map(|field| field.ty).collect()
@@ -878,31 +883,33 @@ impl InterfaceGenerator<'_> {
                 if self.lower_helpers.contains_key(&id) {
                     return;
                 }
-                let name = if self
-                    .world_gen
-                    .can_share_export_lower_helper(self.resolve, &Type::Id(id))
-                {
-                    let helper_name = format!("wit_bindgen_lower_t{}", id.index());
-                    if self
+                if !type_contains_future_or_stream(self.resolve, ty) {
+                    let name = if self
                         .world_gen
-                        .export_lower_helpers
-                        .insert(id, helper_name.clone())
-                        .is_none()
+                        .can_share_export_lower_helper(self.resolve, &Type::Id(id))
                     {
-                        self.new_export_lower_helpers.insert(id);
-                    }
-                    let package = self.world_gen.export_lower_package();
-                    format!(
-                        "{}{}",
-                        self.world_gen
-                            .pkg_resolver
-                            .qualify_package(self.name, &package),
-                        helper_name
-                    )
-                } else {
-                    format!("__wit_bindgen_lower_t{}", id.index())
-                };
-                self.lower_helpers.insert(id, name);
+                        let helper_name = format!("wit_bindgen_lower_t{}", id.index());
+                        if self
+                            .world_gen
+                            .export_lower_helpers
+                            .insert(id, helper_name.clone())
+                            .is_none()
+                        {
+                            self.new_export_lower_helpers.insert(id);
+                        }
+                        let package = self.world_gen.export_lower_package();
+                        format!(
+                            "{}{}",
+                            self.world_gen
+                                .pkg_resolver
+                                .qualify_package(self.name, &package),
+                            helper_name
+                        )
+                    } else {
+                        format!("__wit_bindgen_lower_t{}", id.index())
+                    };
+                    self.lower_helpers.insert(id, name);
+                }
                 // Collect child types first to avoid borrow conflicts.
                 let children: Vec<Type> = match &self.resolve.types[id].kind {
                     TypeDefKind::Record(r) => r.fields.iter().map(|f| f.ty).collect(),
@@ -984,6 +991,7 @@ impl InterfaceGenerator<'_> {
                     "value".to_string(),
                     &ty,
                     id,
+                    abi::Realloc::Export("cabi_realloc"),
                 );
                 let body = mem::take(&mut f.src);
 
@@ -1008,6 +1016,24 @@ impl InterfaceGenerator<'_> {
             uwriteln!(
                 output,
                 "\n#doc(hidden)\n{visibility}fn {name}(ptr : Int, value : {value_ty}) -> Unit {{\n{body}\n}}\n"
+            );
+
+            // The memory owner frees buffers after the caller has consumed the
+            // result. Share the same type/package placement as owned lowering,
+            // but never reclaim handles which have transferred to the caller.
+            let mut f = FunctionBindgen::new_with_context(
+                self,
+                Box::new(["ptr".to_string()]),
+                package,
+                package,
+            );
+            f.outline_deallocations = true;
+            abi::deallocate_lists_from_memory_root(resolve, &mut f, "ptr".into(), id);
+            let body = mem::take(&mut f.src);
+            let name = name.replace("wit_bindgen_lower_t", "wit_bindgen_deallocate_t");
+            uwriteln!(
+                output,
+                "\n#doc(hidden)\n{visibility}fn {name}(ptr : Int) -> Unit {{\n{body}\n}}\n"
             );
         }
         output
@@ -1364,6 +1390,7 @@ impl InterfaceGenerator<'_> {
                 (0..sig.results.len()).map(|i| format!("p{i}")).collect(),
             );
 
+            bindgen.outline_deallocations = true;
             abi::post_return(bindgen.interface_gen.resolve, func, &mut bindgen);
 
             let src = bindgen.src;
@@ -1954,6 +1981,7 @@ struct FunctionBindgen<'a, 'b> {
     commit_endpoints: bool,
     sync_import_argument_types: Option<Vec<Type>>,
     async_state: AsyncFunctionState,
+    outline_deallocations: bool,
 }
 
 impl<'a, 'b> FunctionBindgen<'a, 'b> {
@@ -1993,6 +2021,7 @@ impl<'a, 'b> FunctionBindgen<'a, 'b> {
             commit_endpoints: false,
             sync_import_argument_types: None,
             async_state: AsyncFunctionState::default(),
+            outline_deallocations: false,
         }
     }
 
@@ -2947,6 +2976,18 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                 )
             }
 
+            Instruction::DeallocateNamedFromMemory { ty, offset } => {
+                let name = self
+                    .deallocate_helper_name(self.interface_gen.resolve, *ty)
+                    .unwrap();
+                uwriteln!(
+                    self.src,
+                    "{name}(({}) + {})",
+                    operands[0],
+                    offset.size_wasm32()
+                );
+            }
+
             Instruction::I32Load8U { offset } => {
                 self.use_ffi(ffi::LOAD8_U);
                 results.push(format!(
@@ -3478,6 +3519,14 @@ impl Bindgen for FunctionBindgen<'_, '_> {
 
     fn lower_helper_name(&self, _resolve: &Resolve, id: TypeId) -> Option<String> {
         self.interface_gen.lower_helpers.get(&id).cloned()
+    }
+
+    fn deallocate_helper_name(&self, resolve: &Resolve, id: TypeId) -> Option<String> {
+        if !self.outline_deallocations {
+            return None;
+        }
+        self.lower_helper_name(resolve, id)
+            .map(|name| name.replace("wit_bindgen_lower_t", "wit_bindgen_deallocate_t"))
     }
 }
 
@@ -4711,5 +4760,47 @@ mod tests {
         assert!(ffi.contains(r#""$root" "[future-new-unit]exchange""#));
         assert!(ffi.contains(r#""$root" "[async-lower][future-read-unit]exchange""#));
         assert!(ffi.contains(r#""$root" "[future-cancel-read-unit]exchange""#));
+    }
+
+    #[test]
+    fn post_return_helpers_share_resource_graphs_without_dropping_handles() {
+        let files = generate(
+            r#"
+            package test:cleanup;
+            interface model {
+                resource token;
+                record leaf { token: own<token>, name: string }
+                type alias = leaf;
+                record graph { leaves: list<alias>, suffix: string }
+            }
+            interface first {
+                use model.{graph};
+                get: func() -> graph;
+                get-again: func() -> result<graph, graph>;
+            }
+            interface second {
+                use model.{graph};
+                get: func() -> graph;
+            }
+            world service { import model; export first; export second; }
+            "#,
+            "service",
+        );
+        let shared = file(&files, "gen/wit_bindgen_export_lower/ffi.mbt");
+        assert_eq!(shared.matches("fn wit_bindgen_deallocate_t").count(), 2);
+        for helper in shared.split("fn wit_bindgen_deallocate_t").skip(1) {
+            let body = helper.split("\n}\n").next().unwrap();
+            assert!(!body.contains(".drop("), "{body}");
+            assert!(!body.contains(".drop_sync("), "{body}");
+            assert!(body.contains("mbt_ffi_free"), "{body}");
+        }
+        for interface in ["first", "second"] {
+            let ffi = file(
+                &files,
+                &format!("gen/interface/test/cleanup/{interface}/ffi.mbt"),
+            );
+            assert!(ffi.contains(".wit_bindgen_deallocate_t"), "{ffi}");
+            assert!(!ffi.contains("fn __wit_bindgen_deallocate_t"), "{ffi}");
+        }
     }
 }
