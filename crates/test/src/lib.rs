@@ -137,6 +137,7 @@ impl Opts {
         Runner {
             opts: self.clone(),
             rust_state: None,
+            go_state: None,
             wit_bindgen: wit_bindgen.to_path_buf(),
             test_runner: runner::TestRunner::new(&self.runner)?,
         }
@@ -196,6 +197,9 @@ struct Component {
 
     /// Runtime flags to wasmtime.
     wasmtime_flags: config::StringList,
+
+    /// Expected text when execution of this component's runtime case fails.
+    runtime_failure: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -254,6 +258,7 @@ struct Verify<'a> {
 struct Runner {
     opts: Opts,
     rust_state: Option<rust::State>,
+    go_state: Option<go::State>,
     wit_bindgen: PathBuf,
     test_runner: runner::TestRunner,
 }
@@ -471,6 +476,7 @@ impl Runner {
             contents,
             lang_config: config.lang,
             wasmtime_flags: config.wasmtime_flags,
+            runtime_failure: config.runtime_failure.into(),
         })
     }
 
@@ -578,7 +584,7 @@ impl Runner {
                     let me = self.clone();
                     let should_fail = language
                         .obj()
-                        .should_fail_verify(&args_kind, &config, &args);
+                        .should_fail_verify(self, &args_kind, &config, &args);
 
                     let name = format!("{language} {args_kind} {test:?}");
                     Trial::test(&name, move || {
@@ -703,17 +709,23 @@ impl Runner {
                     let compilations = compilations.clone();
                     let test = test.clone();
                     let component = component.clone();
+                    let should_fail = component.language.obj().should_fail_compile(
+                        self,
+                        &component.path,
+                        &component.bindgen.wit_config,
+                    );
                     Trial::test(&component.path.display().to_string(), move || {
                         let result = me.compile_component(&test, &component).with_context(|| {
                             format!("failed to compile component {:?}", component.path)
                         });
                         match result {
-                            Ok(path) => {
+                            Ok(path) if !should_fail => {
                                 compilations.lock().unwrap().push((test, component, path));
                                 Ok(())
                             }
-                            Err(e) => me.render_error(
-                                StepResult::new(Err(e))
+                            other => me.render_error(
+                                StepResult::new(other.map(|_| ()))
+                                    .should_fail(should_fail)
                                     .metadata("component", &component.name)
                                     .metadata("path", component.path.display()),
                             ),
@@ -764,9 +776,38 @@ impl Runner {
                     let runner_path = runner_path.to_path_buf();
                     let case = tests[case_name.as_str()].clone();
                     Trial::test(&name, move || {
+                        let expected_failure = [&runner]
+                            .into_iter()
+                            .chain(test_components.iter().map(|(component, _)| component))
+                            .flat_map(|component| component.runtime_failure.iter())
+                            .map(String::as_str)
+                            .collect::<Vec<_>>();
                         let result = me
                             .runtime_test(&case, &runner, &runner_path, &test_components)
                             .with_context(|| format!("failed to run `{}`", case.name));
+                        let result = if expected_failure.is_empty() {
+                            result
+                        } else {
+                            match result {
+                                Ok(()) => Err(anyhow::anyhow!(
+                                    "runtime test succeeded instead of failing with all of {expected_failure:?}"
+                                )),
+                                Err(error) => {
+                                    let message = format!("{error:#}");
+                                    let missing = expected_failure
+                                        .iter()
+                                        .filter(|expected| !message.contains(*expected))
+                                        .collect::<Vec<_>>();
+                                    if missing.is_empty() {
+                                        Ok(())
+                                    } else {
+                                        Err(error.context(format!(
+                                            "runtime failure did not contain {missing:?}"
+                                        )))
+                                    }
+                                }
+                            }
+                        };
                         me.render_error(
                             StepResult::new(result)
                                 .metadata("runner", runner.path.display())
@@ -1280,7 +1321,25 @@ trait LanguageMethods {
 
     /// Returns whether this language is supposed to fail this codegen tests
     /// given the `config` and `args` for the test.
-    fn should_fail_verify(&self, name: &str, config: &config::WitConfig, args: &[String]) -> bool;
+    fn should_fail_verify(
+        &self,
+        runner: &Runner,
+        name: &str,
+        config: &config::WitConfig,
+        args: &[String],
+    ) -> bool;
+
+    /// Returns whether this language is expected to fail to compile the
+    /// runtime test component described by `config`.
+    fn should_fail_compile(
+        &self,
+        runner: &Runner,
+        path: &Path,
+        config: &config::WitConfig,
+    ) -> bool {
+        let _ = (runner, path, config);
+        false
+    }
 
     /// Performs a "check" or a verify that the generated bindings described by
     /// `Verify` are indeed valid.

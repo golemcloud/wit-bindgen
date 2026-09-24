@@ -1,0 +1,12 @@
+//@ async = true
+package test:byte-stream-batching;
+
+interface producer {
+  produce: async func(bytes: bool) -> stream<u8>;
+}
+
+world test { export producer; }
+world runner {
+  import producer;
+  export run: async func();
+}
