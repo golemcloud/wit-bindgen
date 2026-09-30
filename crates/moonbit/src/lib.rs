@@ -141,6 +141,36 @@ fn export_disambiguator(resolve: &Resolve, key: Option<&WorldKey>, world: WorldI
     out
 }
 
+/// Returns a stable identifier for a named aggregate's semantic WIT identity.
+///
+/// `TypeId` values reflect parser allocation order, so embedding them in
+/// generated helper names causes unrelated helpers to be renamed whenever a
+/// type is inserted earlier in the input. Records and variants are named WIT
+/// types, which lets their package/interface/type path provide a stable key.
+fn abi_helper_type_name(resolve: &Resolve, id: TypeId) -> String {
+    let ty = &resolve.types[id];
+    let owner = match ty.owner {
+        TypeOwner::Interface(owner) => resolve
+            .id_of(owner)
+            .unwrap_or_else(|| resolve.interfaces[owner].name.clone().unwrap()),
+        TypeOwner::World(owner) => resolve.worlds[owner].name.clone(),
+        TypeOwner::None => "anonymous".to_string(),
+    };
+    let identity = format!("{owner}/{}", ty.name.as_deref().unwrap());
+    let mut name = String::new();
+    let mut separator = false;
+    for ch in identity.chars() {
+        if ch.is_ascii_alphanumeric() {
+            name.push(ch.to_ascii_lowercase());
+            separator = false;
+        } else if !separator && !name.is_empty() {
+            name.push('_');
+            separator = true;
+        }
+    }
+    name.trim_end_matches('_').to_string()
+}
+
 #[derive(Default)]
 pub struct MoonBit {
     opts: Opts,
@@ -421,6 +451,9 @@ impl WorldGenerator for MoonBit {
             r#gen.import(func);
         }
 
+        r#gen.generate_lift_helper_bodies();
+        r#gen.generate_lower_helper_bodies();
+
         let fragment = r#gen.finish();
         // Write files
         {
@@ -475,6 +508,9 @@ impl WorldGenerator for MoonBit {
         for (_, func) in funcs {
             r#gen.import(func);
         }
+
+        r#gen.generate_lift_helper_bodies();
+        r#gen.generate_lower_helper_bodies();
 
         let result = r#gen.finish();
         self.import_world_fragment.concat(result);
@@ -777,6 +813,14 @@ impl InterfaceGenerator<'_> {
         }
     }
 
+    fn abi_helper_name(&self, operation: &str, id: TypeId, public: bool) -> String {
+        format!(
+            "{}wit_bindgen_{operation}_{}",
+            if public { "" } else { "__" },
+            abi_helper_type_name(self.resolve, id)
+        )
+    }
+
     fn register_lift_helpers(&mut self, ty: &Type) {
         let Type::Id(id) = ty else { return };
         let id = *id;
@@ -793,11 +837,12 @@ impl InterfaceGenerator<'_> {
                 // and cancellation state. Only their endpoint-free children
                 // can use context-free memory helpers.
                 if !type_contains_future_or_stream(self.resolve, ty) {
-                    let name = if self
-                        .world_gen
-                        .can_share_export_lower_helper(self.resolve, &Type::Id(id))
-                    {
-                        let helper_name = format!("wit_bindgen_lift_t{}", id.index());
+                    let public = self.direction == Direction::Export
+                        && self
+                            .world_gen
+                            .can_share_export_lower_helper(self.resolve, &Type::Id(id));
+                    let name = if public {
+                        let helper_name = self.abi_helper_name("lift", id, true);
                         if self
                             .world_gen
                             .export_lift_helpers
@@ -815,7 +860,7 @@ impl InterfaceGenerator<'_> {
                             helper_name
                         )
                     } else {
-                        format!("__wit_bindgen_lift_t{}", id.index())
+                        self.abi_helper_name("lift", id, false)
                     };
                     self.lift_helpers.insert(id, name);
                 }
@@ -884,11 +929,12 @@ impl InterfaceGenerator<'_> {
                     return;
                 }
                 if !type_contains_future_or_stream(self.resolve, ty) {
-                    let name = if self
-                        .world_gen
-                        .can_share_export_lower_helper(self.resolve, &Type::Id(id))
-                    {
-                        let helper_name = format!("wit_bindgen_lower_t{}", id.index());
+                    let public = self.direction == Direction::Export
+                        && self
+                            .world_gen
+                            .can_share_export_lower_helper(self.resolve, &Type::Id(id));
+                    let name = if public {
+                        let helper_name = self.abi_helper_name("lower", id, true);
                         if self
                             .world_gen
                             .export_lower_helpers
@@ -906,7 +952,7 @@ impl InterfaceGenerator<'_> {
                             helper_name
                         )
                     } else {
-                        format!("__wit_bindgen_lower_t{}", id.index())
+                        self.abi_helper_name("lower", id, false)
                     };
                     self.lower_helpers.insert(id, name);
                 }
@@ -1030,7 +1076,7 @@ impl InterfaceGenerator<'_> {
 
                 let (name, cleanup) = if borrowed {
                     (
-                        name.replace("wit_bindgen_lower_t", "wit_bindgen_borrow_lower_t"),
+                        name.replace("wit_bindgen_lower_", "wit_bindgen_borrow_lower_"),
                         ", cleanup_list : Array[Int]",
                     )
                 } else {
@@ -1054,7 +1100,7 @@ impl InterfaceGenerator<'_> {
             f.outline_deallocations = true;
             abi::deallocate_lists_from_memory_root(resolve, &mut f, "ptr".into(), id);
             let body = mem::take(&mut f.src);
-            let name = name.replace("wit_bindgen_lower_t", "wit_bindgen_deallocate_t");
+            let name = name.replace("wit_bindgen_lower_", "wit_bindgen_deallocate_");
             uwriteln!(
                 output,
                 "\n#doc(hidden)\n{visibility}fn {name}(ptr : Int) -> Unit {{\n{body}\n}}\n"
@@ -1168,6 +1214,14 @@ impl InterfaceGenerator<'_> {
         let endpoint_plan = self.import_async_function_plan(self.interface, func);
         let wasm_sig = self.resolve.wasm_signature(variant, func);
         let mbt_sig = self.world_gen.pkg_resolver.mbt_sig(self.name, func, false);
+
+        for param in &func.params {
+            self.register_lower_helpers(&param.ty);
+        }
+        if let Some(result) = &func.result {
+            self.register_lift_helpers(result);
+        }
+
         let (src, needs_cleanup_list, endpoint_state) = if async_plan.is_async() {
             let body = self.generate_async_import_body(&endpoint_plan, func, &mbt_sig, &wasm_sig);
             (body.src, body.needs_cleanup_list, body.state)
@@ -1180,6 +1234,7 @@ impl InterfaceGenerator<'_> {
                     .collect(),
             )
             .with_async_state(endpoint_plan.state());
+            bindgen.borrowed_lower = true;
             if endpoint_plan.has_endpoints() {
                 bindgen = bindgen.with_sync_import_commit(
                     func.params.iter().map(|Param { ty, .. }| *ty).collect(),
@@ -2992,7 +3047,7 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                     .lower_helper_name(self.interface_gen.resolve, *ty)
                     .expect("lower helper must be registered before it is emitted");
                 let cleanup = if self.borrowed_lower {
-                    name = name.replace("wit_bindgen_lower_t", "wit_bindgen_borrow_lower_t");
+                    name = name.replace("wit_bindgen_lower_", "wit_bindgen_borrow_lower_");
                     self.needs_cleanup_list = true;
                     ", cleanup_list"
                 } else {
@@ -3557,7 +3612,7 @@ impl Bindgen for FunctionBindgen<'_, '_> {
             return None;
         }
         self.lower_helper_name(resolve, id)
-            .map(|name| name.replace("wit_bindgen_lower_t", "wit_bindgen_deallocate_t"))
+            .map(|name| name.replace("wit_bindgen_lower_", "wit_bindgen_deallocate_"))
     }
 }
 
@@ -3859,6 +3914,38 @@ mod tests {
             .iter()
             .map(|(name, contents)| (name.to_string(), contents.to_vec()))
             .collect()
+    }
+
+    fn abi_helpers(source: &str) -> BTreeMap<String, String> {
+        let mut helpers = BTreeMap::new();
+        for marker in ["fn __wit_bindgen_", "fn wit_bindgen_"] {
+            let mut remaining = source;
+            while let Some(start) = remaining.find(marker) {
+                remaining = &remaining[start..];
+                let name_end = remaining.find('(').unwrap();
+                let name = remaining[3..name_end].to_string();
+                let body_start = remaining.find('{').unwrap();
+                let mut depth = 0;
+                let mut body_end = None;
+                for (offset, ch) in remaining[body_start..].char_indices() {
+                    match ch {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                body_end = Some(body_start + offset + 1);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let body_end = body_end.unwrap();
+                helpers.insert(name, remaining[..body_end].to_string());
+                remaining = &remaining[body_end..];
+            }
+        }
+        helpers
     }
 
     #[test]
@@ -4285,16 +4372,87 @@ mod tests {
         );
 
         let shared = file(&files, "gen/wit_bindgen_export_lower/ffi.mbt");
-        assert_eq!(shared.matches("pub fn wit_bindgen_lower_t").count(), 1);
-        assert_eq!(shared.matches("pub fn wit_bindgen_lift_t").count(), 1);
+        assert_eq!(shared.matches("pub fn wit_bindgen_lower_").count(), 1);
+        assert_eq!(shared.matches("pub fn wit_bindgen_lift_").count(), 1);
 
         let first = file(&files, "gen/interface/test/shared-lowering/first/ffi.mbt");
         let second = file(&files, "gen/interface/test/shared-lowering/second/ffi.mbt");
         for wrapper in [first, second] {
-            assert!(wrapper.contains("@wit_bindgen_export_lower.wit_bindgen_lower_t"));
-            assert!(wrapper.contains("@wit_bindgen_export_lower.wit_bindgen_lift_t"));
-            assert!(!wrapper.contains("fn __wit_bindgen_lower_t"));
-            assert!(!wrapper.contains("fn __wit_bindgen_lift_t"));
+            assert!(wrapper.contains("@wit_bindgen_export_lower.wit_bindgen_lower_"));
+            assert!(wrapper.contains("@wit_bindgen_export_lower.wit_bindgen_lift_"));
+            assert!(!wrapper.contains("fn __wit_bindgen_lower_"));
+            assert!(!wrapper.contains("fn __wit_bindgen_lift_"));
+        }
+    }
+
+    #[test]
+    fn import_abi_helpers_are_reused_with_distinct_sync_and_async_ownership() {
+        let files = generate(
+            r#"
+            package test:import-helper-reuse;
+            interface api {
+                record leaf { name: string, tags: list<string> }
+                variant branch { leaf(leaf), children(list<leaf>), empty }
+                record schema-value-tree {
+                    root: branch,
+                    alternatives: list<branch>,
+                    metadata: list<tuple<string, string>>,
+                }
+                accept-first: func(values: list<schema-value-tree>);
+                accept-second: func(values: list<schema-value-tree>);
+                return-first: func() -> list<schema-value-tree>;
+                return-second: func() -> list<schema-value-tree>;
+                accept-later: async func(values: list<schema-value-tree>);
+            }
+            world service { import api; }
+            "#,
+            "service",
+        );
+        let ffi = file(&files, "interface/test/import-helper-reuse/api/ffi.mbt");
+        let api = file(&files, "interface/test/import-helper-reuse/api/top.mbt");
+        let suffix = "test_import_helper_reuse_api_schema_value_tree";
+        let borrowed = format!("__wit_bindgen_borrow_lower_{suffix}");
+        let owned = format!("__wit_bindgen_lower_{suffix}");
+        let lift = format!("__wit_bindgen_lift_{suffix}");
+
+        assert_eq!(ffi.matches(&format!("fn {borrowed}(")).count(), 1);
+        assert_eq!(ffi.matches(&format!("fn {owned}(")).count(), 1);
+        assert_eq!(ffi.matches(&format!("fn {lift}(")).count(), 1);
+        assert_eq!(api.matches(&format!("{borrowed}(")).count(), 2);
+        assert_eq!(api.matches(&format!("{owned}(")).count(), 1);
+        assert_eq!(api.matches(&format!("{lift}(")).count(), 2);
+        assert!(api.contains("cleanup_list.each(mbt_ffi_free)"), "{api}");
+    }
+
+    #[test]
+    fn inserting_a_variant_does_not_rename_or_rewrite_existing_helpers() {
+        let wit = |inserted: &str| {
+            format!(
+                r#"
+                package test:stable-helper-names;
+                interface api {{
+                    {inserted}
+                    record leaf {{ value: string }}
+                    variant branch {{ leaf(leaf), leaves(list<leaf>) }}
+                    record tree {{ branch: branch, siblings: list<branch> }}
+                    send: func(values: list<tree>) -> list<tree>;
+                }}
+                world service {{ import api; }}
+                "#
+            )
+        };
+        let baseline = generate(&wit(""), "service");
+        let inserted = generate(
+            &wit("variant unrelated { number(u32), text(string), empty }"),
+            "service",
+        );
+        let path = "interface/test/stable-helper-names/api/ffi.mbt";
+        let baseline_helpers = abi_helpers(file(&baseline, path));
+        let inserted_helpers = abi_helpers(file(&inserted, path));
+
+        assert!(!baseline_helpers.is_empty());
+        for (name, body) in baseline_helpers {
+            assert_eq!(inserted_helpers.get(&name), Some(&body), "helper {name}");
         }
     }
 
@@ -4322,7 +4480,7 @@ mod tests {
         );
         let shared = file(&files, "gen/wit_bindgen_export_lower/ffi.mbt");
         assert_eq!(
-            shared.matches("pub fn wit_bindgen_borrow_lower_t").count(),
+            shared.matches("pub fn wit_bindgen_borrow_lower_").count(),
             2
         );
         assert!(shared.contains("cleanup_list.push(ptr0)"));
@@ -4332,7 +4490,7 @@ mod tests {
                 &files,
                 &format!("gen/interface/test/async-lowering/{interface}/ffi.mbt"),
             );
-            assert!(wrapper.contains("@wit_bindgen_export_lower.wit_bindgen_borrow_lower_t"));
+            assert!(wrapper.contains("@wit_bindgen_export_lower.wit_bindgen_borrow_lower_"));
             assert!(wrapper.contains("cleanup_list.push(address)"));
             assert!(wrapper.contains("TaskReturn(address, (return_value).length())"));
             assert!(wrapper.contains("cleanup_list.each(mbt_ffi_free)"));
@@ -4861,8 +5019,8 @@ mod tests {
             "service",
         );
         let shared = file(&files, "gen/wit_bindgen_export_lower/ffi.mbt");
-        assert_eq!(shared.matches("fn wit_bindgen_deallocate_t").count(), 2);
-        for helper in shared.split("fn wit_bindgen_deallocate_t").skip(1) {
+        assert_eq!(shared.matches("fn wit_bindgen_deallocate_").count(), 2);
+        for helper in shared.split("fn wit_bindgen_deallocate_").skip(1) {
             let body = helper.split("\n}\n").next().unwrap();
             assert!(!body.contains(".drop("), "{body}");
             assert!(!body.contains(".drop_sync("), "{body}");
@@ -4873,8 +5031,8 @@ mod tests {
                 &files,
                 &format!("gen/interface/test/cleanup/{interface}/ffi.mbt"),
             );
-            assert!(ffi.contains(".wit_bindgen_deallocate_t"), "{ffi}");
-            assert!(!ffi.contains("fn __wit_bindgen_deallocate_t"), "{ffi}");
+            assert!(ffi.contains(".wit_bindgen_deallocate_"), "{ffi}");
+            assert!(!ffi.contains("fn __wit_bindgen_deallocate_"), "{ffi}");
         }
     }
 }
