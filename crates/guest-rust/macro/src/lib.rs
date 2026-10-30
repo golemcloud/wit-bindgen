@@ -19,10 +19,31 @@ pub fn generate(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
         .into()
 }
 
-fn anyhow_to_syn(span: Span, err: anyhow::Error) -> Error {
+fn render_error(
+    err: &(dyn std::error::Error + 'static),
+    sourcemap: &Option<&wit_bindgen_core::wit_parser::SourceMap>,
+) -> String {
+    if let Some(sourcemap) = sourcemap {
+        if let Some(e) = err.downcast_ref::<wit_bindgen_core::wit_parser::ParseError>() {
+            return e.render(sourcemap);
+        }
+        if let Some(e) = err.downcast_ref::<wit_bindgen_core::wit_parser::ResolveError>() {
+            return e.render(sourcemap);
+        }
+    }
+
+    err.to_string()
+}
+
+fn anyhow_to_syn(
+    span: Span,
+    err: anyhow::Error,
+    sourcemap: Option<&wit_bindgen_core::wit_parser::SourceMap>,
+) -> Error {
     let err = attach_with_context(err);
-    let mut msg = err.to_string();
+    let mut msg = render_error(err.as_ref(), &sourcemap);
     for cause in err.chain().skip(1) {
+        let cause = render_error(cause, &sourcemap);
         msg.push_str(&format!("\n\nCaused by:\n  {cause}"));
     }
     Error::new(span, msg)
@@ -65,7 +86,7 @@ impl Parse for Config {
         let mut world = None;
         let mut source = None;
         let mut features = Vec::new();
-        let mut async_configured = false;
+        let mut sync_configured = false;
         let mut method_chaining_configured = false;
         let mut debug = false;
 
@@ -132,7 +153,14 @@ impl Parse for Config {
                     Opt::AdditionalMemberAttributes(list) => {
                         opts.additional_member_attributes = list
                     }
-                    Opt::With(with) => opts.with.extend(with),
+                    Opt::With(with) => {
+                        // `HashMap` iteration order is non-deterministic, which can cause
+                        // non-determinism in crates that invoke the macro. Sort by key so the
+                        // output is stable.
+                        let mut with: Vec<_> = with.into_iter().collect();
+                        with.sort_by(|a, b| a.0.cmp(&b.0));
+                        opts.with.extend(with)
+                    }
                     Opt::GenerateAll => {
                         opts.generate_all = true;
                     }
@@ -163,11 +191,11 @@ impl Parse for Config {
                     Opt::Debug(enable) => {
                         debug = enable.value();
                     }
-                    Opt::Async(val, span) => {
-                        if async_configured {
-                            return Err(Error::new(span, "cannot specify second async config"));
+                    Opt::Sync(val, span) => {
+                        if sync_configured {
+                            return Err(Error::new(span, "cannot specify second sync config"));
                         }
-                        async_configured = true;
+                        sync_configured = true;
                         opts.async_ = val;
                     }
                     Opt::ChainableMethods(val, span) => {
@@ -193,11 +221,10 @@ impl Parse for Config {
                 )]));
             }
         }
-        let (resolve, main_packages, files) =
-            parse_source(&source, &features).map_err(|err| anyhow_to_syn(call_site, err))?;
+        let (resolve, main_packages, files) = parse_source(&source, &features)?;
         let world = resolve
             .select_world(&main_packages, world.as_deref())
-            .map_err(|e| anyhow_to_syn(call_site, e))?;
+            .map_err(|e| anyhow_to_syn(call_site, e, None))?;
         Ok(Config {
             opts,
             resolve,
@@ -212,49 +239,56 @@ impl Parse for Config {
 fn parse_source(
     source: &Option<Source>,
     features: &[String],
-) -> anyhow::Result<(Resolve, Vec<PackageId>, Vec<PathBuf>)> {
+) -> syn::Result<(Resolve, Vec<PackageId>, Vec<PathBuf>)> {
     let mut resolve = Resolve::default();
     resolve.features.extend(features.iter().cloned());
     let mut files = Vec::new();
     let mut pkgs = Vec::new();
     let root = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    let mut parse = |paths: &[PathBuf]| -> anyhow::Result<()> {
-        for path in paths {
-            let p = root.join(path);
-            // Try to normalize the path to make the error message more understandable when
-            // the path is not correct. Fallback to the original path if normalization fails
-            // (probably return an error somewhere else).
-            let normalized_path = match std::fs::canonicalize(&p) {
-                Ok(p) => p,
-                Err(_) => p.to_path_buf(),
-            };
-            let (pkg, sources) = resolve.push_path(normalized_path)?;
-            pkgs.push(pkg);
-            files.extend(sources.paths().map(|p| p.to_owned()));
-        }
-        Ok(())
-    };
-    let default = root.join("wit");
-    match source {
-        Some(Source::Inline(s, path)) => {
-            match path {
-                Some(p) => parse(p)?,
-                // If no `path` is explicitly specified still parse the default
-                // `wit` directory if it exists. Don't require its existence,
-                // however, as `inline` can be used in lieu of a folder. Test
-                // whether it exists and only if there is it parsed.
-                None => {
-                    if default.exists() {
-                        parse(&[default])?;
+
+    let mut try_parse = || -> anyhow::Result<()> {
+        let mut parse = |paths: &[PathBuf]| -> anyhow::Result<()> {
+            for path in paths {
+                let p = root.join(path);
+                // Try to normalize the path to make the error message more understandable when
+                // the path is not correct. Fallback to the original path if normalization fails
+                // (probably return an error somewhere else).
+                let normalized_path = match std::fs::canonicalize(&p) {
+                    Ok(p) => p,
+                    Err(_) => p.to_path_buf(),
+                };
+                let (pkg, sources) = resolve.push_path(normalized_path)?;
+                pkgs.push(pkg);
+                files.extend(sources.paths().map(|p| p.to_owned()));
+            }
+            Ok(())
+        };
+        let default = root.join("wit");
+
+        match source {
+            Some(Source::Inline(s, path)) => {
+                match path {
+                    Some(p) => parse(p)?,
+                    // If no `path` is explicitly specified still parse the default
+                    // `wit` directory if it exists. Don't require its existence,
+                    // however, as `inline` can be used in lieu of a folder. Test
+                    // whether it exists and only if there is it parsed.
+                    None => {
+                        if default.exists() {
+                            parse(&[default])?;
+                        }
                     }
                 }
+                pkgs.clear();
+                pkgs.push(resolve.push_str("macro-input", s)?);
+                Ok(())
             }
-            pkgs.clear();
-            pkgs.push(resolve.push_str("macro-input", s)?);
+            Some(Source::Paths(p)) => parse(p),
+            None => parse(&[default]),
         }
-        Some(Source::Paths(p)) => parse(p)?,
-        None => parse(&[default])?,
     };
+
+    try_parse().map_err(|e| anyhow_to_syn(Span::call_site(), e, Some(&resolve.source_map)))?;
 
     Ok((resolve, pkgs, files))
 }
@@ -265,7 +299,7 @@ impl Config {
         let mut generator = self.opts.build();
         generator
             .generate(&mut self.resolve, self.world, &mut files)
-            .map_err(|e| anyhow_to_syn(Span::call_site(), e))?;
+            .map_err(|e| anyhow_to_syn(Span::call_site(), e, None))?;
         let (_, src) = files.iter().next().unwrap();
         let mut src = std::str::from_utf8(src).unwrap().to_string();
 
@@ -339,6 +373,7 @@ mod kw {
     syn::custom_keyword!(imports);
     syn::custom_keyword!(debug);
     syn::custom_keyword!(chainable_methods);
+    syn::custom_keyword!(sync);
     syn::custom_keyword!(merge_structurally_equal_types);
 }
 
@@ -420,7 +455,7 @@ enum Opt {
     GenerateUnusedTypes(syn::LitBool),
     Features(Vec<syn::LitStr>),
     DisableCustomSectionLinkHelpers(syn::LitBool),
-    Async(AsyncFilterSet, Span),
+    Sync(AsyncFilterSet, Span),
     Debug(syn::LitBool),
     ChainableMethods(ChainableMethodFilterSet, Span),
     MergeStructurallyEqualTypes(syn::LitBool),
@@ -619,21 +654,29 @@ impl Parse for Opt {
                 set.push(&val.value());
             }
             Ok(Opt::ChainableMethods(set, span))
-        } else if l.peek(Token![async]) {
-            let span = input.parse::<Token![async]>()?.span;
+        } else if l.peek(kw::sync) {
+            let span = input.parse::<kw::sync>()?.span;
             input.parse::<Token![:]>()?;
+            let mut set = AsyncFilterSet::default();
             if input.peek(syn::LitBool) {
-                let enabled = input.parse::<syn::LitBool>()?.value;
-                Ok(Opt::Async(AsyncFilterSet::all(enabled), span))
+                if input.parse::<syn::LitBool>()?.value {
+                    set.push("all");
+                }
             } else {
-                let mut set = AsyncFilterSet::default();
                 let contents;
                 syn::bracketed!(contents in input);
                 for val in contents.parse_terminated(|p| p.parse::<syn::LitStr>(), Token![,])? {
                     set.push(&val.value());
                 }
-                Ok(Opt::Async(set, span))
             }
+            Ok(Opt::Sync(set, span))
+        } else if input.peek(Token![async]) {
+            let span = input.parse::<Token![async]>()?.span;
+            Err(Error::new(
+                span,
+                "the `async` option has been removed: functions that are `async` \
+                 in WIT get async bindings by default, and `sync` opts them out",
+            ))
         } else if l.peek(kw::merge_structurally_equal_types) {
             input.parse::<kw::merge_structurally_equal_types>()?;
             input.parse::<Token![:]>()?;

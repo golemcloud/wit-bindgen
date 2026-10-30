@@ -1,15 +1,15 @@
 ///|
 pub struct Sink[X] {
-  priv write : async (ArrayView[X]) -> Int
+  priv write : async (ArrayView[X]) -> Int32
   priv close : async () -> Unit
   priv is_open : () -> Bool
   priv has_cleanup : () -> Bool
   priv cleanup : ((X) -> Unit)?
-  priv write_window_size : Int
+  priv write_window_size : Int32
 }
 
 ///|
-let default_sink_write_window_size : Int = 64
+let default_sink_write_window_size : Int32 = 64
 
 ///|
 /// The write callback must either raise before consuming any value or return
@@ -18,11 +18,11 @@ let default_sink_write_window_size : Int = 64
 /// The close callback must be idempotent.
 #internal(wit_bindgen, "generated binding code only")
 pub fn[X] Sink::from_callbacks(
-  write : async (ArrayView[X]) -> Int,
+  write : async (ArrayView[X]) -> Int32,
   close : async () -> Unit,
   is_open : () -> Bool,
   cleanup : ((X) -> Unit)?,
-  write_window_size? : Int = default_sink_write_window_size,
+  write_window_size~ : Int32 = default_sink_write_window_size,
 ) -> Sink[X] {
   guard! write_window_size > 0
   {
@@ -40,7 +40,7 @@ pub fn[X] Sink::from_callbacks(
 ///
 /// Consumption includes values accepted by the peer and values recursively
 /// cleaned after the peer closes. Check `is_open()` to distinguish those cases.
-pub async fn[X] Sink::write(self : Sink[X], data : ArrayView[X]) -> Int {
+pub async fn[X] Sink::write(self : Sink[X], data : ArrayView[X]) -> Int32 {
   if data.length() == 0 {
     return 0
   }
@@ -66,7 +66,7 @@ pub async fn[X] Sink::write(self : Sink[X], data : ArrayView[X]) -> Int {
 /// This is the byte-stream counterpart of `write(ArrayView[T])`. MoonBit keeps
 /// `BytesView` and `ArrayView[Byte]` as distinct types, so byte strings need a
 /// separate entry point until the language provides a shared read-only view.
-pub async fn Sink::write_bytes(self : Sink[Byte], data : BytesView) -> Int {
+pub async fn Sink::write_bytes(self : Sink[Byte], data : BytesView) -> Int32 {
   if data.length() == 0 {
     return 0
   }
@@ -95,7 +95,7 @@ pub fn[X] Sink::is_open(self : Sink[X]) -> Bool {
 fn[X] Sink::cleanup_unaccepted(
   self : Sink[X],
   data : ArrayView[X],
-  offset : Int,
+  offset : Int32,
 ) -> Unit {
   match self.cleanup {
     Some(cleanup) =>
@@ -110,7 +110,7 @@ fn[X] Sink::cleanup_unaccepted(
 fn Sink::cleanup_unaccepted_bytes(
   self : Sink[Byte],
   data : BytesView,
-  offset : Int,
+  offset : Int32,
 ) -> Unit {
   match self.cleanup {
     Some(cleanup) =>
@@ -135,9 +135,7 @@ pub async fn[X] Sink::write_all(self : Sink[X], data : ArrayView[X]) -> Bool {
       return true
     }
     let written = {
-      errdefer {
-        self.cleanup_unaccepted(data, offset)
-      }
+      errdefer self.cleanup_unaccepted(data, offset)
       self.write(data[offset:])
     }
     offset = offset + written
@@ -158,9 +156,7 @@ pub async fn Sink::write_all_bytes(self : Sink[Byte], data : BytesView) -> Bool 
       return true
     }
     let written = {
-      errdefer {
-        self.cleanup_unaccepted_bytes(data, offset)
-      }
+      errdefer self.cleanup_unaccepted_bytes(data, offset)
       self.write_bytes(data[offset:])
     }
     offset = offset + written
@@ -221,13 +217,13 @@ fn[X] local_future_get(state : Ref[LocalFutureState[X]]) -> X raise {
       state.val.closed = true
       value
     }
-    None => raise Cancelled::Cancelled
+    None => raise FutureReadError::Dropped
   }
 }
 
 ///|
 priv struct StreamPipeReader[X] {
-  max : Int
+  max : Int32
   mut value : FixedArray[X]?
   mut ended : Bool
   mut coro : Coroutine?
@@ -236,20 +232,20 @@ priv struct StreamPipeReader[X] {
 ///|
 priv struct StreamPipeWriter[X] {
   mut value : FixedArray[X]?
-  mut accepted : Int
+  mut accepted : Int32
   mut coro : Coroutine?
 }
 
 ///|
 priv struct StreamPipe[X] {
-  capacity : Int
+  capacity : Int32
   chunks : @deque.Deque[FixedArray[X]]
-  mut buffered : Int
+  mut buffered : Int32
   mut writer_closed : Bool
   mut reader_dropped : Bool
   mut cleanup : ((X) -> Unit)?
   mut head : FixedArray[X]?
-  mut head_pos : Int
+  mut head_pos : Int32
   readers : @deque.Deque[StreamPipeReader[X]]
   writers : @deque.Deque[StreamPipeWriter[X]]
 }
@@ -274,7 +270,7 @@ fn[X] wake_stream_pipe_reader(
 ///|
 fn[X] wake_stream_pipe_writer(
   writer : StreamPipeWriter[X],
-  accepted : Int,
+  accepted : Int32,
 ) -> Unit {
   match writer.coro {
     Some(coro) => {
@@ -414,7 +410,7 @@ fn[X] stream_pipe_close_writer(pipe : Ref[StreamPipe[X]]) -> Unit {
 async fn[X] stream_pipe_write(
   pipe : Ref[StreamPipe[X]],
   data : ArrayView[X],
-) -> Int {
+) -> Int32 {
   if data.length() == 0 || pipe.val.writer_closed || pipe.val.reader_dropped {
     return 0
   }
@@ -445,12 +441,13 @@ async fn[X] stream_pipe_write(
     coro: Some(current_coroutine()),
   }
   pipe.val.writers.push_back(writer)
-  suspend() catch {
-    _ if writer.coro is None => return writer.accepted
-    err => {
+  match suspend_check_cancel() {
+    Continue => ()
+    Cancelled if writer.coro is None => return writer.accepted
+    Cancelled => {
       writer.coro = None
       writer.value = None
-      raise err
+      raise_cancellation_signal()
     }
   }
   writer.value = None
@@ -460,7 +457,7 @@ async fn[X] stream_pipe_write(
 ///|
 async fn[X] stream_pipe_read(
   pipe : Ref[StreamPipe[X]],
-  count : Int,
+  count : Int32,
 ) -> FixedArray[X]? {
   if count <= 0 {
     return Some([])
@@ -512,14 +509,12 @@ async fn[X] stream_pipe_read(
       coro: Some(current_coroutine()),
     }
     pipe.val.readers.push_back(reader)
-    suspend() catch {
-      err => {
-        reader.coro = None
-        match reader.value {
-          Some(value) => return Some(value)
-          None if reader.ended => return None
-          None => raise err
-        }
+    if suspend_check_cancel() is Cancelled {
+      reader.coro = None
+      match reader.value {
+        Some(value) => return Some(value)
+        None if reader.ended => return None
+        None => raise_cancellation_signal()
       }
     }
     match reader.value {
@@ -562,17 +557,17 @@ pub fn[X] Future::ready_with_cleanup(
   cleanup : (X) -> Unit,
 ) -> Future[X] {
   let state : Ref[LocalFutureState[X]] = {
-    val: { value: Some(value), closed: false, cleanup: Some(cleanup) },
+    val: { value: Some(value), closed: false, cleanup: Some(cleanup), },
   }
-  { inner: Local(state) }
+  { inner: Local(state), }
 }
 
 ///|
 pub fn[X] Future::ready(value : X) -> Future[X] {
   let state : Ref[LocalFutureState[X]] = {
-    val: { value: Some(value), closed: false, cleanup: None },
+    val: { value: Some(value), closed: false, cleanup: None, },
   }
-  { inner: Local(state) }
+  { inner: Local(state), }
 }
 
 ///|
@@ -585,7 +580,9 @@ pub fn[X] Future::from(
   producer : async () -> X,
   on_unstarted_drop? : () -> Unit,
 ) -> Future[X] {
-  { inner: Pending({ val: { producer: Some(producer), on_unstarted_drop } }) }
+  {
+    inner: Pending({ val: { producer: Some(producer), on_unstarted_drop, }, }),
+  }
 }
 
 ///|
@@ -595,7 +592,7 @@ pub fn[X] Future::from_source(
   close : async () -> Unit,
   close_sync : () -> Unit,
 ) -> Future[X] {
-  { inner: Source({ get, close, close_sync }) }
+  { inner: Source({ get, close, close_sync, }), }
 }
 
 ///|
@@ -614,7 +611,7 @@ pub async fn[X] Future::get(self : Future[X]) -> X {
           state.val.on_unstarted_drop = None
           producer()
         }
-        None => raise Cancelled::Cancelled
+        None => raise FutureReadError::Dropped
       }
     Promised(cell) => promised_future_get(cell)
   }
@@ -698,7 +695,7 @@ priv struct StreamProducerState[X] {
 
 ///|
 priv struct StreamSource[X] {
-  read : async (Int) -> FixedArray[X]?
+  read : async (Int32) -> FixedArray[X]?
   close : async () -> Unit
   close_sync : () -> Unit
 }
@@ -717,7 +714,7 @@ pub struct Stream[X] {
 
 ///|
 fn[X] new_stream_pipe(
-  capacity : Int,
+  capacity : Int32,
   cleanup : ((X) -> Unit)?,
 ) -> Ref[StreamPipe[X]] {
   if capacity < 0 {
@@ -758,11 +755,11 @@ fn[X] stream_pipe_sink(pipe : Ref[StreamPipe[X]]) -> Sink[X] {
 
 ///|
 fn[X] new_local_stream(
-  capacity : Int,
+  capacity : Int32,
   cleanup : ((X) -> Unit)?,
 ) -> (Stream[X], Sink[X]) {
   let pipe = new_stream_pipe(capacity, cleanup)
-  let stream = Stream::{ inner: Local(pipe) }
+  let stream = Stream::{ inner: Local(pipe), }
   let sink = stream_pipe_sink(pipe)
   (stream, sink)
 }
@@ -792,11 +789,7 @@ fn[X] materialize_stream_producer(
           state.val.on_unstarted_drop = None
           let sink = stream_pipe_sink(pipe)
           spawn_stream_producer(async fn() {
-            defer {
-              sink.close() catch {
-                _ => ()
-              }
-            }
+            defer stream_pipe_close_writer(pipe)
             producer(sink)
           })
         }
@@ -808,7 +801,7 @@ fn[X] materialize_stream_producer(
 }
 
 ///|
-pub fn[X] Stream::new(capacity? : Int = 0) -> (Stream[X], Sink[X]) {
+pub fn[X] Stream::new(capacity~ : Int32 = 0) -> (Stream[X], Sink[X]) {
   new_local_stream(capacity, None)
 }
 
@@ -817,7 +810,7 @@ pub fn[X] Stream::new(capacity? : Int = 0) -> (Stream[X], Sink[X]) {
 /// end is dropped.
 pub fn[X] Stream::new_with_cleanup(
   cleanup : (X) -> Unit,
-  capacity? : Int = 0,
+  capacity~ : Int32 = 0,
 ) -> (Stream[X], Sink[X]) {
   new_local_stream(capacity, Some(cleanup))
 }
@@ -840,7 +833,7 @@ pub fn[X] Stream::produce(
 ) -> Stream[X] {
   {
     inner: Outgoing({
-      val: { producer: Some(producer), cleanup, on_unstarted_drop, pipe: None },
+      val: { producer: Some(producer), cleanup, on_unstarted_drop, pipe: None, },
     }),
   }
 }
@@ -848,11 +841,11 @@ pub fn[X] Stream::produce(
 ///|
 #internal(wit_bindgen, "generated binding code only")
 pub fn[X] Stream::from_source(
-  read : async (Int) -> FixedArray[X]?,
+  read : async (Int32) -> FixedArray[X]?,
   close : async () -> Unit,
   close_sync : () -> Unit,
 ) -> Stream[X] {
-  { inner: Source({ read, close, close_sync }) }
+  { inner: Source({ read, close, close_sync, }), }
 }
 
 ///|
@@ -862,7 +855,7 @@ pub fn[X] Stream::from_source(
 /// reports no progress. `None` means the writable end has closed and no
 /// buffered values remain. A non-positive count returns an empty chunk without
 /// waiting.
-pub async fn[X] Stream::read(self : Stream[X], count : Int) -> FixedArray[X]? {
+pub async fn[X] Stream::read(self : Stream[X], count : Int32) -> FixedArray[X]? {
   match self.inner {
     Source(source) => (source.read)(count)
     Local(pipe) => stream_pipe_read(pipe, count)

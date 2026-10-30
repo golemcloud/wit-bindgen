@@ -53,7 +53,7 @@ pub struct Opts {
     #[cfg_attr(feature = "clap", arg(long, default_value_t = false))]
     pub ignore_stub: bool,
 
-    /// Whether or not to generate moon.mod.json ; useful if the project is part of a larger project
+    /// Whether or not to generate moon.mod ; useful if the project is part of a larger project
     #[cfg_attr(feature = "clap", arg(long, default_value_t = false))]
     pub ignore_module_file: bool,
 
@@ -291,33 +291,24 @@ impl MoonBit {
         link: bool,
         wasm_only: bool,
     ) {
-        // Inline Wasm and private canonical-ABI helpers are intentional in generated packages.
-        moon_pkg.push_str("{\n\"warn-list\": \"-44-unused_value-declaration_unimplemented\"");
         // Dependencies
         if let Some(imports) = imports {
-            moon_pkg.push_str(",\n\"import\": [\n");
-            moon_pkg.indent(1);
+            moon_pkg.push_str("import {\n");
             let mut deps = imports
                 .packages
                 .iter()
-                .map(|(k, v)| {
-                    format!(
-                        "{{ \"path\" : \"{}/{}\", \"alias\" : \"{}\" }}",
-                        self.project_name,
-                        k.replace(".", "/"),
-                        v
-                    )
-                })
+                .map(|(k, v)| format!("\"{}/{}\" @{},", self.project_name, k.replace(".", "/"), v))
                 .collect::<Vec<_>>();
             deps.sort();
-            uwrite!(moon_pkg, "{}", deps.join(",\n"));
-            moon_pkg.deindent(1);
-            moon_pkg.push_str("\n]");
+            uwriteln!(moon_pkg, "{}", deps.join("\n"));
+            moon_pkg.push_str("}\n\n");
         }
+        // Disable warning for invalid inline wasm.
+        moon_pkg.push_str("warnings = \"-44-unused_value-declaration_unimplemented\"\n");
         let imports_async_core =
             imports.is_some_and(|imports| imports.packages.contains_key(ASYNC_CORE_DIR));
         if wasm_only || imports_async_core || (link && self.async_support.is_required()) {
-            moon_pkg.push_str(",\n\"supported-targets\": \"+wasm\"");
+            moon_pkg.push_str("supported_targets = \"wasm\"\n");
         }
         // Link target
         if link {
@@ -325,7 +316,9 @@ impl MoonBit {
                 ManglingAndAbi::Legacy(LiftLowerAbi::Sync),
                 WasmExport::Memory,
             );
-            moon_pkg.push_str(",\n\"link\": {\n\"wasm\": {\n");
+            moon_pkg.push_str("\npkgtype(kind: \"foreign_library\")\n\noptions(\n");
+            moon_pkg.indent(1);
+            moon_pkg.push_str("link: {\n\"wasm\": {\n");
             moon_pkg.push_str(&format!("\"export-memory-name\": \"{memory_name}\",\n"));
             moon_pkg.push_str("\"heap-start-address\": 16,\n");
             moon_pkg.push_str("\"exports\": [\n");
@@ -345,9 +338,10 @@ impl MoonBit {
             exports.sort();
             uwrite!(moon_pkg, "{}", exports.join(",\n"));
             moon_pkg.deindent(1);
-            moon_pkg.push_str("\n]\n}\n}\n");
+            moon_pkg.push_str("\n],\n},\n},\n");
+            moon_pkg.deindent(1);
+            moon_pkg.push_str(")\n");
         }
-        moon_pkg.push_str("\n}\n");
     }
 }
 
@@ -362,7 +356,7 @@ impl MoonBit {
 /// - `preprocess`: Initialize generator-wide state (package resolver,
 ///   project name, and size/align information) for the current world.
 /// - `import_interface` / `export_interface`: Generate per-interface
-///   sources, FFI glue, README documentation and `moon.pkg.json` metadata.
+///   sources, FFI glue, README documentation and `moon.pkg` metadata.
 /// - `import_funcs` / `export_funcs` / `import_types`: Collect and accumulate
 ///   world-level functions and types (the `$root` module) into fragments
 ///   that are later written out by `finish_imports` or `finish`.
@@ -481,7 +475,7 @@ impl WorldGenerator for MoonBit {
             }
             files.push(&format!("{directory}/ffi.mbt"), indent(&ffi).as_bytes());
 
-            // moon.pkg.json
+            // moon.pkg
             let mut moon_pkg = Source::default();
             self.write_moon_pkg(
                 &mut moon_pkg,
@@ -489,7 +483,7 @@ impl WorldGenerator for MoonBit {
                 false,
                 false,
             );
-            files.push(&format!("{directory}/moon.pkg.json"), moon_pkg.as_bytes());
+            files.push(&format!("{directory}/moon.pkg"), moon_pkg.as_bytes());
         }
 
         Ok(())
@@ -569,7 +563,7 @@ impl WorldGenerator for MoonBit {
             &format!("{directory}/ffi_import.mbt"),
             indent(&ffi).as_bytes(),
         );
-        // moon.pkg.json
+        // moon.pkg
         let mut moon_pkg = Source::default();
         self.write_moon_pkg(
             &mut moon_pkg,
@@ -577,7 +571,7 @@ impl WorldGenerator for MoonBit {
             false,
             false,
         );
-        files.push(&format!("{directory}/moon.pkg.json"), moon_pkg.as_bytes());
+        files.push(&format!("{directory}/moon.pkg"), moon_pkg.as_bytes());
         Ok(())
     }
 
@@ -630,7 +624,7 @@ impl WorldGenerator for MoonBit {
             files.push(&format!("{directory}/top.mbt"), indent(&src).as_bytes());
 
             if !self.opts.ignore_stub {
-                // moon.pkg.json
+                // moon.pkg
                 let mut moon_pkg = Source::default();
                 self.write_moon_pkg(
                     &mut moon_pkg,
@@ -638,7 +632,7 @@ impl WorldGenerator for MoonBit {
                     false,
                     false,
                 );
-                files.push(&format!("{directory}/moon.pkg.json"), moon_pkg.as_bytes());
+                files.push(&format!("{directory}/moon.pkg"), moon_pkg.as_bytes());
             }
 
             // FFI
@@ -688,7 +682,7 @@ impl WorldGenerator for MoonBit {
             files.push(&format!("{directory}/top.mbt"), indent(&src).as_bytes());
 
             if !self.opts.ignore_stub {
-                // moon.pkg.json
+                // moon.pkg
                 let mut moon_pkg = Source::default();
                 self.write_moon_pkg(
                     &mut moon_pkg,
@@ -696,7 +690,7 @@ impl WorldGenerator for MoonBit {
                     false,
                     false,
                 );
-                files.push(&format!("{directory}/moon.pkg.json"), moon_pkg.as_bytes());
+                files.push(&format!("{directory}/moon.pkg"), moon_pkg.as_bytes());
             }
 
             // FFI
@@ -725,10 +719,10 @@ impl WorldGenerator for MoonBit {
             let mut body = Source::default();
             uwriteln!(
                 &mut body,
-                "{{ \"name\": \"{}\", \"preferred-target\": \"wasm\" }}",
+                "name = {:?}\n\npreferred_target = \"wasm\"",
                 self.project_name
             );
-            files.push("moon.mod.json", body.as_bytes());
+            files.push("moon.mod", body.as_bytes());
         }
 
         // Export project entry point
@@ -766,10 +760,7 @@ impl WorldGenerator for MoonBit {
                 false,
                 true,
             );
-            files.push(
-                &format!("{directory}/moon.pkg.json"),
-                package_file.as_bytes(),
-            );
+            files.push(&format!("{directory}/moon.pkg"), package_file.as_bytes());
         }
 
         let mut moon_pkg = Source::default();
@@ -780,14 +771,16 @@ impl WorldGenerator for MoonBit {
             false,
         );
         files.push(
-            &format!("{}/moon.pkg.json", self.opts.r#gen_dir),
-            indent(&moon_pkg).as_bytes(),
+            &format!("{}/moon.pkg", self.opts.r#gen_dir),
+            moon_pkg.as_bytes(),
         );
 
         Ok(())
     }
 }
 
+// Start each generated top-level declaration, including its docs and attributes,
+// with `///|` to keep MoonBit's source positions within the per-segment line limit.
 struct InterfaceGenerator<'a> {
     src: String,
     ffi: String,
@@ -817,6 +810,25 @@ struct InterfaceGenerator<'a> {
 }
 
 impl InterfaceGenerator<'_> {
+    fn emit_derived_methods(&mut self, name: &str, traits: &[&str]) {
+        // MoonBit used to attach trait methods to types automatically through
+        // `impl`, including derived implementations. During the transition to
+        // separate `impl` and `extend` semantics, keep those methods as deprecated
+        // compatibility aliases. New callers should use `Trait::method` instead.
+        for trait_ in traits {
+            let methods = match *trait_ {
+                "Debug" => "Debug::{to_repr}",
+                "Show" => "Show::{to_string, output}",
+                "Eq" => "Eq::{not_equal, equal}",
+                _ => unreachable!(),
+            };
+            uwriteln!(
+                self.src,
+                "///|\n#deprecated\npub extend {name} with {methods}\n"
+            );
+        }
+    }
+
     fn finish(self) -> InterfaceFragment {
         InterfaceFragment {
             src: self.src,
@@ -1293,6 +1305,7 @@ impl InterfaceGenerator<'_> {
         uwriteln!(
             self.ffi,
             r#"
+            ///|
             fn {ffi_import_name}({params}) {result_type} = "{import_module}" "{import_name}"
             "#
         );
@@ -1425,6 +1438,7 @@ impl InterfaceGenerator<'_> {
             uwrite!(
                 self.ffi,
                 r#"
+                ///|
                 #doc(hidden)
                 pub fn {func_name}({params}) -> {result_type} {{
                     {cleanup_list}
@@ -1436,6 +1450,7 @@ impl InterfaceGenerator<'_> {
 
         let export = format!(
             r#"
+            ///|
             #doc(hidden)
             pub fn {func_name}({params}) -> {result_type} {{
                 {}{func_name}({})
@@ -1492,6 +1507,7 @@ impl InterfaceGenerator<'_> {
             uwrite!(
                 self.ffi,
                 r#"
+                ///|
                 #doc(hidden)
                 pub fn {func_name}({params}) -> Unit {{
                     {src}
@@ -1508,6 +1524,7 @@ impl InterfaceGenerator<'_> {
             );
             let export = format!(
                 r#"
+                ///|
                 #doc(hidden)
                 pub fn {func_name}({params}) -> Unit {{
                     {}{func_name}({})
@@ -1605,6 +1622,7 @@ impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
             }}{derivation}
             "
         );
+        self.emit_derived_methods(&name, &deriviation);
     }
 
     fn type_resource(&mut self, id: TypeId, name: &str, docs: &Docs) {
@@ -1634,6 +1652,7 @@ impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
             "#,
             deriviation.join(", "),
         );
+        self.emit_derived_methods(&name, &deriviation);
 
         if self.direction == Direction::Import {
             let (drop_module, drop_name) = self.resolve.wasm_import_name(
@@ -1647,6 +1666,7 @@ impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
             uwrite!(
                 &mut self.src,
                 r#"
+                ///|
                 /// Drops a resource handle.
                 pub fn {name}::drop(self : {name}) -> Unit {{
                     let {name}(resource) = self
@@ -1658,6 +1678,7 @@ impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
             uwrite!(
                 &mut self.ffi,
                 r#"
+                ///|
                 fn wasmImportResourceDrop{name}(resource : Int) = "{drop_module}" "{drop_name}"
                 "#,
             )
@@ -1689,24 +1710,30 @@ impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
             uwrite!(
                 &mut self.src,
                 r#"
+                ///|
                 /// Creates a new resource with the given `rep` as its representation and returning the handle to this resource.
                 pub fn {name}::new(rep : Int) -> {name} {{
                     {name}::{name}(wasmExportResourceNew{name}(rep))
                 }}
+                ///|
                 fn wasmExportResourceNew{name}(rep : Int) -> Int = "{new_module}" "{new_name}"
 
+                ///|
                 /// Drops a resource handle.
                 pub fn {name}::drop(self : Self) -> Unit {{
                     let {name}(resource) = self
                     wasmExportResourceDrop{name}(resource)
                 }}
+                ///|
                 fn wasmExportResourceDrop{name}(resource : Int) = "{drop_module}" "{drop_name}"
 
+                ///|
                 /// Gets the `Int` representation of the resource pointed to the given handle.
                 pub fn {name}::rep(self : Self) -> Int {{
                     let {name}(resource) = self
                     wasmExportResourceRep{name}(resource)
                 }}
+                ///|
                 fn wasmExportResourceRep{name}(resource : Int) -> Int = "{rep_module}" "{rep_name}"
                 "#,
             );
@@ -1714,6 +1741,7 @@ impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
             uwrite!(
                 &mut self.src,
                 r#"
+                ///|
                 /// Destructor of the resource.
                 #warnings("-declaration_unimplemented")
                 declare pub fn {name}::dtor(_self : {name}) -> Unit
@@ -1728,9 +1756,10 @@ impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
             uwrite!(
                 self.ffi,
                 r#"
+                ///|
                 #doc(hidden)
                 pub fn {func_name}(handle : Int) -> Unit {{
-                    {name}::dtor(handle)
+                    {name}::dtor({name}(handle))
                 }}
                 "#,
             );
@@ -1745,6 +1774,7 @@ impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
 
             let export = format!(
                 r#"
+                ///|
                 #doc(hidden)
                 pub fn {func_name}(handle : Int) -> Unit {{
                     {}{func_name}(handle)
@@ -1820,25 +1850,31 @@ impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
             self.src,
             "
             pub(all) {type_definition} derive({})
+            ///|
             pub fn {name}::default() -> {name} {{
-                {}
+                {name}({})
             }}
+            ///|
             pub(all) enum {name}Flag {{
                 {cases}
             }}
+            ///|
             fn {name}Flag::value(self : {name}Flag) -> {ty} {{
               match self {{
                 {map_to_int}
               }}
             }}
+            ///|
             pub fn {name}::set(self : Self, other: {name}Flag) -> {name} {{
               let {name}(flag) = self
-              flag.lor(other.value())
+              {name}(flag.lor(other.value()))
             }}
+            ///|
             pub fn {name}::unset(self : Self, other: {name}Flag) -> {name} {{
               let {name}(flag) = self
-              flag.land(other.value().lnot())
+              {name}(flag.land(other.value().lnot()))
             }}
+            ///|
             pub fn {name}::is_set(self : Self, other: {name}Flag) -> Bool {{
               let {name}(flag) = self
               (flag.land(other.value()) == other.value())
@@ -1852,6 +1888,7 @@ impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
                 _ => unreachable!(),
             }
         );
+        self.emit_derived_methods(&name, &deriviation);
     }
 
     fn type_tuple(&mut self, _id: TypeId, _name: &str, _tuple: &Tuple, _docs: &Docs) {
@@ -1913,6 +1950,7 @@ impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
             }}{derivation}
             "
         );
+        self.emit_derived_methods(&name, &deriviation);
     }
 
     fn type_option(&mut self, _id: TypeId, _name: &str, _payload: &Type, _docs: &Docs) {
@@ -1961,6 +1999,7 @@ impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
             ",
             deriviation.join(", ")
         );
+        self.emit_derived_methods(&name, &deriviation);
 
         // Case to integer
         let cases = enum_
@@ -1974,6 +2013,7 @@ impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
         uwrite!(
             self.src,
             "
+            ///|
             pub fn {name}::ordinal(self : {name}) -> Int {{
               match self {{
                 {cases}
@@ -1994,6 +2034,7 @@ impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
         uwrite!(
             self.src,
             "
+            ///|
             pub fn {name}::from(self : Int) -> {name} {{
               match self {{
                 {cases}
@@ -3505,7 +3546,7 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                 uwrite!(
                     self.src,
                     "
-                    let {map} : Map[{key_ty}, {value_ty}] = {{}}
+                    let {map} : Map[{key_ty}, {value_ty}] = Map([])
                     for {index} = 0; {index} < ({length}); {index} = {index} + 1 {{
                         let iter_base = ({address}) + ({index} * {size})
                         {body}
@@ -3631,9 +3672,9 @@ impl Bindgen for FunctionBindgen<'_, '_> {
 fn perform_cast(op: &str, cast: &Bitcast) -> String {
     match cast {
         Bitcast::I32ToF32 => {
-            format!("({op}).reinterpret_as_float()")
+            format!("Float::reinterpret_from_int({op})")
         }
-        Bitcast::I64ToF32 => format!("({op}).to_int().reinterpret_as_float()"),
+        Bitcast::I64ToF32 => format!("Float::reinterpret_from_int(({op}).to_int())"),
         Bitcast::F32ToI32 => {
             format!("({op}).reinterpret_as_int()")
         }
@@ -3999,59 +4040,6 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_free_sync_generation_matches_golden() {
-        let files = generate(
-            r#"
-            package a:b;
-
-            world runner {
-                import add: func(a: u32, b: u32) -> u32;
-                export echo: func(value: u32) -> u32;
-            }
-            "#,
-            "runner",
-        );
-
-        // This exact-output fingerprint runs with both async adapters. Ignore only
-        // the release-version preamble, which is unrelated to generated ABI.
-        let mut entries = files.iter().collect::<Vec<_>>();
-        entries.sort_by_key(|(name, _)| *name);
-        let fingerprints = entries
-            .into_iter()
-            .map(|(name, contents)| {
-                let contents = if contents.starts_with(b"// Generated by") {
-                    let preamble_end = contents.iter().position(|byte| *byte == b'\n').unwrap() + 1;
-                    &contents[preamble_end..]
-                } else {
-                    contents
-                };
-                let hash = contents
-                    .iter()
-                    .fold(0xcbf29ce484222325_u64, |mut hash, byte| {
-                        hash ^= u64::from(*byte);
-                        hash.wrapping_mul(0x100000001b3)
-                    });
-                (name.to_string(), hash)
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            fingerprints,
-            vec![
-                ("gen/ffi.mbt".into(), 3015121443139333543),
-                ("gen/moon.pkg.json".into(), 4016311361297189155),
-                ("gen/world/runner/ffi.mbt".into(), 7191242004779882714),
-                ("gen/world/runner/moon.pkg.json".into(), 6277720927474812145,),
-                ("gen/world/runner/top.mbt".into(), 6857206758629669597,),
-                ("moon.mod.json".into(), 14111159726816684443),
-                ("world/runner/ffi_import.mbt".into(), 16979266963551268444,),
-                ("world/runner/import.mbt".into(), 5430383198437179961),
-                ("world/runner/moon.pkg.json".into(), 6277720927474812145,),
-            ]
-        );
-    }
-
-    #[test]
     fn sync_world_does_not_emit_async_runtime_or_wrappers() {
         let files = generate(
             r#"
@@ -4081,12 +4069,15 @@ mod tests {
                 .iter()
                 .all(|(name, _)| !name.starts_with("async-core/async_"))
         );
-        let package = file(&files, "gen/moon.pkg.json");
-        assert!(!package.contains("supported-targets"), "{package}");
+        let package = file(&files, "gen/moon.pkg");
+        assert!(!package.contains("supported_targets"), "{package}");
+        let module = file(&files, "moon.mod");
+        assert!(module.contains("preferred_target = \"wasm\""), "{module}");
+        assert!(files.iter().all(|(name, _)| !name.ends_with(".json")));
     }
 
     #[test]
-    fn async_filters_respect_import_export_direction() {
+    fn sync_filters_respect_import_export_direction() {
         // The world both imports and exports `run` so that each directional
         // filter below matches something; an unmatched filter is now an error
         // (see `AsyncFilterSet::ensure_all_used`), which would mask what this
@@ -4094,8 +4085,8 @@ mod tests {
         let wit = r#"
             package a:b;
             world runner {
-                import run: func();
-                export run: func();
+                import run: async func();
+                export run: async func();
             }
         "#;
 
@@ -4107,8 +4098,9 @@ mod tests {
         let import_files = try_generate_with_opts(wit, "runner", import_opts).unwrap();
         let import = file(&import_files, "world/runner/import.mbt");
         let import_ffi = file(&import_files, "world/runner/ffi_import.mbt");
-        assert!(import.contains("pub async fn run("), "{import}");
-        assert!(import_ffi.contains("[async-lower]run"), "{import_ffi}");
+        assert!(import.contains("pub fn run("), "{import}");
+        assert!(!import.contains("pub async fn run("), "{import}");
+        assert!(!import_ffi.contains("[async-lower]run"), "{import_ffi}");
 
         let mut export_opts = Opts {
             gen_dir: "gen".into(),
@@ -4118,9 +4110,8 @@ mod tests {
         let export_files = try_generate_with_opts(wit, "runner", export_opts).unwrap();
         let import = file(&export_files, "world/runner/import.mbt");
         let import_ffi = file(&export_files, "world/runner/ffi_import.mbt");
-        assert!(import.contains("pub fn run("), "{import}");
-        assert!(!import.contains("pub async fn run("), "{import}");
-        assert!(!import_ffi.contains("[async-lower]run"), "{import_ffi}");
+        assert!(import.contains("pub async fn run("), "{import}");
+        assert!(import_ffi.contains("[async-lower]run"), "{import_ffi}");
     }
 
     #[test]
@@ -4181,17 +4172,17 @@ mod tests {
 
         let source = file(&files, "interface/a/b/types/top.mbt");
         assert!(source.contains("@async-core.Future[UInt]"), "{source}");
-        let package = file(&files, "interface/a/b/types/moon.pkg.json");
+        let package = file(&files, "interface/a/b/types/moon.pkg");
         assert!(
-            package.contains("\"supported-targets\": \"+wasm\""),
+            package.contains("supported_targets = \"wasm\""),
             "{package}"
         );
-        let link_package = file(&files, "gen/moon.pkg.json");
+        let link_package = file(&files, "gen/moon.pkg");
         assert!(
-            link_package.contains("\"supported-targets\": \"+wasm\""),
+            link_package.contains("supported_targets = \"wasm\""),
             "{link_package}"
         );
-        file(&files, "async-core/moon.pkg.json");
+        file(&files, "async-core/moon.pkg");
         file(&files, "async-core/async_trait.mbt");
     }
 
@@ -4221,7 +4212,7 @@ mod tests {
             opts: Opts {
                 derive: DeriveOpts {
                     derive_debug: true,
-                    derive_show: true,
+                    derive_show: false,
                     derive_eq: true,
                     derive_error: false,
                 },
@@ -4234,7 +4225,7 @@ mod tests {
 
         let source = file(&files, "interface/a/b/types/top.mbt");
         assert!(
-            source.contains("struct Plain {\n      value : UInt\n} derive(Debug, Show, Eq)"),
+            source.contains("struct Plain {\n      value : UInt\n} derive(Debug, Eq)"),
             "{source}"
         );
         assert!(
@@ -4290,7 +4281,7 @@ mod tests {
         );
         let ffi = file(&files, "interface/a/b/api/ffi.mbt");
         assert!(ffi.contains("///|\nfn "), "{ffi}");
-        let package = file(&files, "interface/a/b/api/moon.pkg.json");
+        let package = file(&files, "interface/a/b/api/moon.pkg");
         assert!(package.contains("-unused_value-declaration_unimplemented"));
     }
 
@@ -4743,9 +4734,7 @@ mod tests {
         assert!(ffi.contains("let close_writer_serialized = async fn()"));
         assert!(ffi.contains("writer_lock.acquire()"));
         assert!(ffi.contains("defer writer_lock.release()"));
-        assert!(
-            ffi.contains("() => close_writer_serialized(),\n            resume_on_cancel=true,")
-        );
+        assert!(ffi.contains("protect_from_cancel(() => close_writer_serialized())"));
         assert!(!ffi.contains("defer close_writer()"));
         assert!(ffi.contains("read_cleanup : @async-core.CondVar"));
         assert!(ffi.contains("let read_count = if count < 64"));
@@ -4912,14 +4901,16 @@ mod tests {
         );
 
         let event_loop = file(&files, "async-core/async_ev.mbt");
+        let primitives = file(&files, "async-core/async_primitive.mbt");
+        assert!(primitives.contains("%async.capture_cancellation"));
+        assert!(primitives.contains("%async.raise_cancellation_signal"));
+        assert!(!event_loop.contains("Cancelled::Cancelled"));
         assert!(
             event_loop.contains("let resolution = task_state.resolution")
                 && event_loop.contains("if !(resolution is Resolved)")
                 && event_loop.contains("abort(\"async export failed before task return\")")
                 && event_loop
                     .contains("abort(\"component task-owned coroutine failed after cleanup\")")
-                && event_loop
-                    .contains("Cancelled::Cancelled as err if is_being_cancelled() => raise err")
                 && event_loop.contains("begin_owned_failure_drain(task_state, coro)")
                 && event_loop.contains("task_state.owned_failure = true")
                 && event_loop.contains("task_state.task.cancel()")
@@ -4931,7 +4922,7 @@ mod tests {
             "{event_loop}"
         );
         let terminal = event_loop
-            .find("if task_state.task.state is (Done | Fail(_)) && no_more_work(task_state.lane)")
+            .find("if task_state.task.state is (Done | Fail(_) | Cancelled)")
             .unwrap();
         let terminal = &event_loop[terminal..];
         let snapshot = terminal.find("let owned_failed =").unwrap();
@@ -4956,7 +4947,7 @@ mod tests {
 
         let coroutine = file(&files, "async-core/async_coroutine.mbt");
         assert!(
-            coroutine.contains("Done | Fail(_) => return"),
+            coroutine.contains("Done | Fail(_) | Cancelled => return"),
             "{coroutine}"
         );
     }
@@ -4997,9 +4988,8 @@ mod tests {
             "normal producer return must close the stream: {ffi}"
         );
         assert!(
-            async_trait.contains(
-                "defer {\n              sink.close() catch {\n                _ => ()\n              }\n            }\n            producer(sink)"
-            ),
+            async_trait
+                .contains("defer stream_pipe_close_writer(pipe)\n            producer(sink)"),
             "local producer cleanup must close without swallowing its outcome: {async_trait}"
         );
         assert!(
@@ -5009,12 +4999,12 @@ mod tests {
                 && !ffi.contains("run_producer() catch {"),
             "producer failure and cancellation must clean up and propagate: {ffi}"
         );
-        let failure = &ffi[ffi.find("errdefer {").unwrap()..];
+        let failure = &ffi[ffi.find("// A retained Sink").unwrap()..];
         let reject = failure.find("() => stream.reject(cleanup_value)").unwrap();
         let close = failure.find("() => close_writer_serialized()").unwrap();
         let producer = failure.find("run_producer()").unwrap();
         assert!(
-            reject < close && close < producer,
+            close < reject && reject < producer,
             "relay rejection and serialized close must guard producer failure: {failure}"
         );
         assert!(

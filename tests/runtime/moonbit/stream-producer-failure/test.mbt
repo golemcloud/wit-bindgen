@@ -1,6 +1,13 @@
 //@ [lang]
 //@ path = 'gen/interface/test/moonbit-stream-producer-failure/operations/stub.mbt'
-//@ pkg_config = """{ "warn-list": "-44", "supported-targets": "+wasm", "import": [{ "path": "test/moonbit-stream-producer-failure/async-core", "alias": "async-core" }, { "path": "test/moonbit-stream-producer-failure/interface/test/moonbit-stream-producer-failure/observer", "alias": "observer" }] }"""
+//@ pkg_config = """
+//@ import {
+//@   "test/moonbit-stream-producer-failure/async-core" @async-core,
+//@   "test/moonbit-stream-producer-failure/interface/test/moonbit-stream-producer-failure/observer" @observer,
+//@ }
+//@ warnings = "-44"
+//@ supported_targets = "wasm"
+//@ """
 
 ///|
 suberror ExpectedProducerFailure derive(Debug)
@@ -22,15 +29,16 @@ pub async fn fail_after_write(
 pub async fn nested_failure(
   background_group : @async-core.TaskGroup[Unit],
 ) -> @async-core.Stream[Byte] {
-  let (defer_gate, _defer_promise) : (
+  let (defer_gate, defer_promise) : (
     @async-core.Future[Unit],
     @async-core.Promise[Unit],
   ) = @async-core.Future::new()
-  background_group.add_defer(async fn() {
+  background_group.add_defer(async fn() nocancel {
     defer @observer.mark(4)
-    defer_gate.get()
+    @async-core.protect_from_cancel(() => defer_gate.get())
   })
   @async-core.Stream::produce(async fn(sink) {
+    defer ignore(defer_promise.complete(()))
     let first : FixedArray[Byte] = [11]
     guard sink.write_all(first[:]) else {
       abort("outer stream closed before accepting its first value")

@@ -18,5 +18,10 @@ impl Guest for Component {
         assert_eq!(values, [11]);
         eprintln!("nested-first-read-complete-11");
         let _ = stream.read(Vec::with_capacity(1)).await;
+        // The stream can close before its owning task finishes its async defers.
+        for _ in 0..32 {
+            wit_bindgen::yield_async().await;
+        }
+        panic!("nested producer failure was swallowed");
     }
 }

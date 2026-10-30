@@ -17,7 +17,7 @@
 /// source; `owned_coroutines` contains only runtime bridge coroutines.
 priv struct ComponentTaskState {
   lane : TaskLane
-  subscribers : Map[Int, Subscriber]
+  subscribers : Map[Int32, Subscriber]
   task : Coroutine
   owned_coroutines : @set.Set[Coroutine]
   mut resolution : TaskResolution
@@ -28,8 +28,8 @@ priv struct ComponentTaskState {
 
 ///|
 priv struct TaskWakeup {
-  reader : Int
-  writer : Int
+  reader : Int32
+  writer : Int32
   mut reading : Bool
   mut signaled : Bool
 }
@@ -78,7 +78,7 @@ fn acknowledge_cancellation(task_state : ComponentTaskState) -> Unit {
   guard task_state.cancellation_pending else { return }
   match task_state.task.state {
     Done => () // The generated wrapper already called task.return.
-    Fail(_) =>
+    Fail(_) | Cancelled =>
       if task_state.resolution is Pending {
         task_cancel()
         task_state.resolution = Resolved
@@ -112,11 +112,11 @@ fn begin_owned_failure_drain(
 ///|
 fn notify_subscriber(
   task_state : ComponentTaskState,
-  waitable_id : Int,
+  waitable_id : Int32,
   event : Events,
 ) -> Unit {
   if task_state.lane.wakeup is Some(wakeup) && wakeup.reader == waitable_id {
-    guard event is StreamRead(i, { progress: 1, copy_result: Completed }) &&
+    guard! event is StreamRead(i, { progress: 1, copy_result: Completed, }) &&
       i == waitable_id
     wakeup.reading = false
     wakeup.signaled = false
@@ -124,7 +124,7 @@ fn notify_subscriber(
     waitable_join(waitable_id, 0)
     return
   }
-  guard task_state.subscribers.get(waitable_id) is Some(subscriber)
+  guard! task_state.subscribers.get(waitable_id) is Some(subscriber)
   subscriber.event = Some(event)
   subscriber.coro.each(Coroutine::wake)
   // Keep the delivered event discoverable until its waiter consumes it. A
@@ -137,13 +137,14 @@ fn notify_subscriber(
 fn next_callback(
   waitable_set : WaitableSet,
   task_state : ComponentTaskState,
-) -> Int {
+) -> Int32 {
   if task_state.resolution is FlushPending {
     task_state.resolution = Resolved
     reschedule(task_state.lane)
   }
   acknowledge_cancellation(task_state)
-  if task_state.task.state is (Done | Fail(_)) && no_more_work(task_state.lane) {
+  if task_state.task.state is (Done | Fail(_) | Cancelled) &&
+    no_more_work(task_state.lane) {
     let resolution = task_state.resolution
     let owned_failed = task_state.owned_failure
     let failed = task_state.task.state is Fail(_)
@@ -180,9 +181,9 @@ fn next_callback(
 ///|
 #internal(wit_bindgen, "generated binding code only")
 #doc(hidden)
-pub fn with_waitableset(f : async () -> Unit) -> Int {
+pub fn with_waitableset(f : async () -> Unit) -> Int32 {
   let waitable_set = WaitableSet::new()
-  let lane = { blocking: 0, run_later: Deque([]), wakeup: None }
+  let lane = { blocking: 0, run_later: Deque([]), wakeup: None, }
   tls_set(waitable_set.0)
   let task = spawn_owned(f, lane, None)
   let task_state = {
@@ -208,15 +209,15 @@ pub fn with_waitableset(f : async () -> Unit) -> Int {
 #doc(hidden)
 pub fn task_returned() -> Unit {
   let waitable_set = current_waitableset()
-  guard component_task_state(waitable_set) is Some(task_state)
-  guard task_state.resolution is Pending
+  guard! component_task_state(waitable_set) is Some(task_state)
+  guard! task_state.resolution is Pending
   task_state.resolution = FlushPending
 }
 
 ///|
 #internal(wit_bindgen, "generated binding code only")
 #doc(hidden)
-pub fn cb(event : Int, waitable_id : Int, code : Int) -> Int {
+pub fn cb(event : Int32, waitable_id : Int32, code : Int32) -> Int32 {
   let waitable_set = current_waitableset()
   guard component_task_state(waitable_set) is Some(task_state) else { panic() }
   let events = Events::new(EventCode::from(event), waitable_id, code)
@@ -265,13 +266,12 @@ let component_tasks : Map[WaitableSet, ComponentTaskState] = Map([])
 #doc(hidden)
 pub fn spawn_component_task_current(f : async () -> Unit) -> Unit {
   let waitable_set = current_waitableset()
-  guard component_task_state(waitable_set) is Some(task_state)
+  guard! component_task_state(waitable_set) is Some(task_state)
   let coro = spawn_owned(
     async fn() -> Unit {
       let coro = current_coroutine()
       defer task_state.owned_coroutines.remove(coro)
       f() catch {
-        Cancelled::Cancelled as err if is_being_cancelled() => raise err
         err => {
           begin_owned_failure_drain(task_state, coro)
           raise err
@@ -298,12 +298,15 @@ pub fn has_component_task_scope() -> Bool {
 ///|
 #internal(wit_bindgen, "generated binding code only")
 #doc(hidden)
-pub fn current_component_task_token() -> Int {
+pub fn current_component_task_token() -> Int32 {
   current_waitableset().0
 }
 
 ///|
-fn detach_waitable(task_state : ComponentTaskState, waitable_id : Int) -> Unit {
+fn detach_waitable(
+  task_state : ComponentTaskState,
+  waitable_id : Int32,
+) -> Unit {
   if task_state.subscribers.get(waitable_id) is Some(subscriber) {
     subscriber.coro.clear()
     task_state.subscribers.remove(waitable_id)
@@ -339,10 +342,10 @@ fn arm_task_wakeup(
     return
   }
   let result = task_wakeup_stream_read(wakeup.reader, 0, 1)
-  guard result == -1
+  guard! result == -1
   let subscribers = task_state.subscribers
-  guard subscribers.get(wakeup.reader) is None
-  subscribers.set(wakeup.reader, { event: None, coro: Set([]) })
+  guard! subscribers.get(wakeup.reader) is None
+  subscribers.set(wakeup.reader, { event: None, coro: Set([]), })
   waitable_join(wakeup.reader, waitable_set.0)
   wakeup.reading = true
   wakeup.signaled = false
@@ -355,7 +358,7 @@ fn signal_component_task(lane : TaskLane) -> Unit {
     return
   }
   let result = StreamResult::from(task_wakeup_stream_write(wakeup.writer, 0, 1))
-  guard result.progress == 1 && result.copy_result is Completed
+  guard! result.progress == 1 && result.copy_result is Completed
   wakeup.signaled = true
 }
 
@@ -390,13 +393,13 @@ fn drop_task_wakeup(task_state : ComponentTaskState) -> Unit {
 
 ///|
 fn cancel_waitable_event(
-  owner_task : Int,
-  waitable_id : Int,
+  owner_task : Int32,
+  waitable_id : Int32,
   cancel : () -> Events,
 ) -> Events {
   let waitable_set = WaitableSet(owner_task)
-  guard component_task_state(waitable_set) is Some(task_state)
-  guard task_state.subscribers.get(waitable_id) is Some(subscriber)
+  guard! component_task_state(waitable_set) is Some(task_state)
+  guard! task_state.subscribers.get(waitable_id) is Some(subscriber)
 
   // Baseline cancel-read is synchronous and traps while its endpoint belongs
   // to a waitable set. Detach before invoking the generated intrinsic.
@@ -415,7 +418,7 @@ fn cancel_waitable_event(
 /// Complete an operation immediately or suspend until its terminal waitable
 /// event arrives. This is the single owner of subscription registration and
 /// detachment for future and stream copy operations.
-async fn waitable_event(waitable_id : Int, immediate : Events?) -> Events {
+async fn waitable_event(waitable_id : Int32, immediate : Events?) -> Events {
   let waitable_set = current_waitableset()
   let task_state = component_task_state(waitable_set).unwrap()
   let subscribers = task_state.subscribers
@@ -434,25 +437,24 @@ async fn waitable_event(waitable_id : Int, immediate : Events?) -> Events {
       let subscriber = if subscribers.get(waitable_id) is Some(subscriber) {
         subscriber
       } else {
-        let subscriber = { event: None, coro: Set([]) }
+        let subscriber = { event: None, coro: Set([]), }
         subscribers.set(waitable_id, subscriber)
         subscriber
       }
-      guard subscriber.event is None
+      guard! subscriber.event is None
       waitable_join(waitable_id, waitable_set.0)
       let coro = current_coroutine()
       subscriber.coro.add(coro)
       defer subscriber.coro.remove(coro)
-      let event = try suspend() catch {
-        err =>
+      let event = match suspend_check_cancel() {
+        Continue => subscriber.event.unwrap()
+        Cancelled =>
           match subscriber.event {
             // Completion owns the canonical buffer once its event is
             // delivered, even if local cancellation wakes the same coroutine.
             Some(event) => event
-            None => raise err
+            None => raise_cancellation_signal()
           }
-      } noraise {
-        _ => subscriber.event.unwrap()
       }
       subscribers.remove(waitable_id)
       event
@@ -464,7 +466,7 @@ async fn waitable_event(waitable_id : Int, immediate : Events?) -> Events {
 #internal(wit_bindgen, "generated binding code only")
 #doc(hidden)
 pub async fn suspend_for_subtask(
-  val : Int,
+  val : Int32,
   settle_lowered_arguments : (Bool) -> Unit,
   drop_returned_result : () -> Unit,
 ) -> Unit {
@@ -507,7 +509,7 @@ pub async fn suspend_for_subtask(
   let waitable_set = current_waitableset()
   let task_state = component_task_state(waitable_set).unwrap()
   let set = @set.Set([])
-  let subscriber = { event: None, coro: set }
+  let subscriber = { event: None, coro: set, }
   let coro = current_coroutine()
   set.add(coro)
   defer {
@@ -516,50 +518,42 @@ pub async fn suspend_for_subtask(
   }
   for ;; {
     let subscribers = task_state.subscribers
-    guard subscribers.get(task.handle) is None
+    guard! subscribers.get(task.handle) is None
     subscribers.set(task.handle, subscriber)
     waitable_join(task.handle, waitable_set.0)
-    suspend() catch {
-      Cancelled::Cancelled =>
-        // Cancel the subtask
-        return protect_from_cancel(() => {
-          detach_waitable(task_state, task.handle)
-          // A terminal event can race with local cancellation after waking
-          // this coroutine. Once delivered, cancelling the subtask again
-          // traps, so consume that event before requesting cancellation.
-          if subscriber.event is Some(Subtask(i, state)) {
-            guard i == task.handle
-            settle_arguments(state)
-            match state {
-              Returned => {
-                drop_returned_result()
-                return
-              }
-              Cancelled_before_started | Cancelled_before_returned =>
-                raise Cancelled::Cancelled
-              Starting | Started => subscriber.event = None
-            }
-          }
-          let state = task.cancel()
+    if suspend_check_cancel() is Cancelled {
+      protect_from_cancel(() => {
+        detach_waitable(task_state, task.handle)
+        // Consume a delivered terminal event before requesting cancellation:
+        // cancelling an already terminal canonical operation traps.
+        if subscriber.event is Some(Subtask(i, state)) {
+          guard! i == task.handle
           settle_arguments(state)
           match state {
             Returned => {
               drop_returned_result()
               return
             }
-            Cancelled_before_started | Cancelled_before_returned =>
-              raise Cancelled::Cancelled
-            Starting | Started => panic()
+            Cancelled_before_started | Cancelled_before_returned => return
+            Starting | Started => subscriber.event = None
           }
-        })
-      err => raise err
+        }
+        let state = task.cancel()
+        settle_arguments(state)
+        match state {
+          Returned => drop_returned_result()
+          Cancelled_before_started | Cancelled_before_returned => ()
+          Starting | Started => panic()
+        }
+      })
+      raise_cancellation_signal()
     }
 
     task_state.subscribers.remove(task.handle)
 
     // Subsequent state, return if finished
     if subscriber.event is Some(Subtask(i, state)) {
-      guard i == task.handle
+      guard! i == task.handle
       settle_arguments(state)
       match state {
         Returned => return
@@ -575,14 +569,14 @@ pub async fn suspend_for_subtask(
 ///|
 #internal(wit_bindgen, "generated binding code only")
 #doc(hidden)
-pub async fn suspend_for_future_read(idx : Int, val : Int) -> Unit {
+pub async fn suspend_for_future_read(idx : Int32, val : Int32) -> Unit {
   let event = if val == -1 {
     waitable_event(idx, None)
   } else {
     let result = FutureReadResult::from(val)
     waitable_event(idx, Some(FutureRead(idx, result)))
   }
-  guard event is FutureRead(i, result) && i == idx
+  guard! event is FutureRead(i, result) && i == idx
   match result {
     Completed => return
     Cancelled => raise FutureReadError::Cancelled
@@ -593,14 +587,14 @@ pub async fn suspend_for_future_read(idx : Int, val : Int) -> Unit {
 #internal(wit_bindgen, "generated binding code only")
 #doc(hidden)
 pub fn cancel_future_read(
-  owner_task : Int,
-  idx : Int,
-  cancel : () -> Int,
+  owner_task : Int32,
+  idx : Int32,
+  cancel : () -> Int32,
 ) -> Bool {
   let event = cancel_waitable_event(owner_task, idx, () => {
     FutureRead(idx, FutureReadResult::from(cancel()))
   })
-  guard event is FutureRead(i, result) && i == idx
+  guard! event is FutureRead(i, result) && i == idx
   match result {
     Completed => true
     Cancelled => false
@@ -611,39 +605,42 @@ pub fn cancel_future_read(
 #internal(wit_bindgen, "generated binding code only")
 #doc(hidden)
 pub fn cancel_stream_read(
-  owner_task : Int,
-  idx : Int,
-  cancel : () -> Int,
-) -> Int {
+  owner_task : Int32,
+  idx : Int32,
+  cancel : () -> Int32,
+) -> Int32 {
   let event = cancel_waitable_event(owner_task, idx, () => {
     StreamRead(idx, StreamResult::from(cancel()))
   })
-  guard event is StreamRead(i, result) && i == idx
+  guard! event is StreamRead(i, result) && i == idx
   result.progress
 }
 
 ///|
 #internal(wit_bindgen, "generated binding code only")
 #doc(hidden)
-pub fn cancel_stream_write(idx : Int, cancel : () -> Int) -> Int {
+pub fn cancel_stream_write(idx : Int32, cancel : () -> Int32) -> Int32 {
   let event = cancel_waitable_event(current_component_task_token(), idx, () => {
     StreamWrite(idx, StreamResult::from(cancel()))
   })
-  guard event is StreamWrite(i, result) && i == idx
+  guard! event is StreamWrite(i, result) && i == idx
   result.progress
 }
 
 ///|
 #internal(wit_bindgen, "generated binding code only")
 #doc(hidden)
-pub async fn suspend_for_future_write_terminal(idx : Int, val : Int) -> Bool? {
+pub async fn suspend_for_future_write_terminal(
+  idx : Int32,
+  val : Int32,
+) -> Bool? {
   let event = if val == -1 {
     waitable_event(idx, None)
   } else {
     let result = FutureWriteResult::from(val)
     waitable_event(idx, Some(FutureWrite(idx, result)))
   }
-  guard event is FutureWrite(i, result) && i == idx
+  guard! event is FutureWrite(i, result) && i == idx
   match result {
     Completed => Some(true)
     Dropped => Some(false)
@@ -654,14 +651,14 @@ pub async fn suspend_for_future_write_terminal(idx : Int, val : Int) -> Bool? {
 ///|
 #internal(wit_bindgen, "generated binding code only")
 #doc(hidden)
-pub async fn suspend_for_stream_read(idx : Int, val : Int) -> (Int, Bool) {
+pub async fn suspend_for_stream_read(idx : Int32, val : Int32) -> (Int32, Bool) {
   let event = if val == -1 {
     waitable_event(idx, None)
   } else {
     let result = StreamResult::from(val)
     waitable_event(idx, Some(StreamRead(idx, result)))
   }
-  guard event is StreamRead(i, { progress, copy_result }) && i == idx
+  guard! event is StreamRead(i, { progress, copy_result, }) && i == idx
   match copy_result {
     Completed => return (progress, false)
     Dropped => return (progress, true)
@@ -677,14 +674,17 @@ pub async fn suspend_for_stream_read(idx : Int, val : Int) -> (Int, Bool) {
 ///|
 #internal(wit_bindgen, "generated binding code only")
 #doc(hidden)
-pub async fn suspend_for_stream_write(idx : Int, val : Int) -> (Int, Bool) {
+pub async fn suspend_for_stream_write(
+  idx : Int32,
+  val : Int32,
+) -> (Int32, Bool) {
   let event = if val == -1 {
     waitable_event(idx, None)
   } else {
     let result = StreamResult::from(val)
     waitable_event(idx, Some(StreamWrite(idx, result)))
   }
-  guard event is StreamWrite(i, { progress, copy_result }) && i == idx
+  guard! event is StreamWrite(i, { progress, copy_result, }) && i == idx
   match copy_result {
     Completed => return (progress, false)
     Dropped => return (progress, true)

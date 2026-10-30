@@ -111,7 +111,7 @@ jobs:
     # macOS/Windows to also get coverage for test-without-a-patched-toolchain.
     - name: Install Patched Go
       run: |
-        curl -OL https://github.com/dicej/go/releases/download/go1.25.5-wasi-on-idle/go-linux-amd64-bootstrap.tbz
+        curl -OL https://github.com/dicej/go/releases/download/go1.27.1-wasi-on-idle/go-linux-amd64-bootstrap.tbz
         tar xf go-linux-amd64-bootstrap.tbz
         echo "$(pwd)/go-linux-amd64-bootstrap/bin" >> $GITHUB_PATH
       if: matrix.lang == 'go' && matrix.os == 'ubuntu-latest'
@@ -119,7 +119,7 @@ jobs:
     - name: Setup Go
       uses: actions/setup-go@v5
       with:
-        go-version: 1.25.4
+        go-version: 1.27.1
       if: matrix.lang == 'go' && matrix.os != 'ubuntu-latest'
 
     - name: Setup D

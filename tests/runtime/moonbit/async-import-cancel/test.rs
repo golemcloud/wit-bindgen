@@ -151,7 +151,7 @@ impl Guest for Component {
     }
 
     async fn settle() {
-        let _ = wit_bindgen::yield_blocking();
+        wit_bindgen::yield_async().await;
     }
 
     fn backpressure_set(value: bool) {
