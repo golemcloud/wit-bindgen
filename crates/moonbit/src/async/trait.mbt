@@ -22,9 +22,9 @@ pub fn[X] Sink::from_callbacks(
   close : async () -> Unit,
   is_open : () -> Bool,
   cleanup : ((X) -> Unit)?,
-  write_window_size : Int,
+  write_window_size? : Int = default_sink_write_window_size,
 ) -> Sink[X] {
-  guard write_window_size > 0
+  guard! write_window_size > 0
   {
     write,
     close,
@@ -52,7 +52,7 @@ pub async fn[X] Sink::write(self : Sink[X], data : ArrayView[X]) -> Int {
   // The callback may suspend, so it must not retain the caller's borrowed view.
   let buffer = FixedArray::from_array(data[:length])
   let written = (self.write)(buffer[:])
-  guard written >= 0 && written <= length
+  guard! written >= 0 && written <= length
   if !(self.is_open)() && written < length && (self.has_cleanup)() {
     self.cleanup_unaccepted(buffer[:], written)
     return length
@@ -77,7 +77,7 @@ pub async fn Sink::write_bytes(self : Sink[Byte], data : BytesView) -> Int {
   }
   let buffer = data[:length].to_fixedarray()
   let written = (self.write)(buffer[:])
-  guard written >= 0 && written <= length
+  guard! written >= 0 && written <= length
   if !(self.is_open)() && written < length && (self.has_cleanup)() {
     self.cleanup_unaccepted(buffer[:], written)
     return length
@@ -134,18 +134,18 @@ pub async fn[X] Sink::write_all(self : Sink[X], data : ArrayView[X]) -> Bool {
     if offset >= data.length() {
       return true
     }
-    let written = self.write(data[offset:]) catch {
-      err => {
+    let written = {
+      errdefer {
         self.cleanup_unaccepted(data, offset)
-        raise err
       }
+      self.write(data[offset:])
     }
     offset = offset + written
     if !self.is_open() {
       self.cleanup_unaccepted(data, offset)
       return false
     }
-    guard written > 0
+    guard! written > 0
   }
 }
 
@@ -157,18 +157,18 @@ pub async fn Sink::write_all_bytes(self : Sink[Byte], data : BytesView) -> Bool 
     if offset >= data.length() {
       return true
     }
-    let written = self.write_bytes(data[offset:]) catch {
-      err => {
+    let written = {
+      errdefer {
         self.cleanup_unaccepted_bytes(data, offset)
-        raise err
       }
+      self.write_bytes(data[offset:])
     }
     offset = offset + written
     if !self.is_open() {
       self.cleanup_unaccepted_bytes(data, offset)
       return false
     }
-    guard written > 0
+    guard! written > 0
   }
 }
 
@@ -792,15 +792,12 @@ fn[X] materialize_stream_producer(
           state.val.on_unstarted_drop = None
           let sink = stream_pipe_sink(pipe)
           spawn_stream_producer(async fn() {
-            producer(sink) catch {
-              _ => {
-                sink.close() catch {
-                  _ => ()
-                }
-                return
+            defer {
+              sink.close() catch {
+                _ => ()
               }
             }
-            sink.close()
+            producer(sink)
           })
         }
         None => stream_pipe_close_writer(pipe)

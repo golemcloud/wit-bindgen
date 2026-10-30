@@ -1,0 +1,29 @@
+package test:moonbit-shared-import-helpers;
+
+interface api {
+  record leaf {
+    name: string,
+    tags: list<string>,
+  }
+
+  variant branch {
+    leaf(leaf),
+    children(list<leaf>),
+    empty,
+  }
+
+  record schema-value-tree {
+    root: branch,
+    alternatives: list<branch>,
+    metadata: list<tuple<string, string>>,
+  }
+
+  accept-first: func(values: list<schema-value-tree>);
+  accept-second: func(values: list<schema-value-tree>);
+  return-first: func() -> list<schema-value-tree>;
+  return-second: func() -> list<schema-value-tree>;
+}
+
+world test {
+  import api;
+}

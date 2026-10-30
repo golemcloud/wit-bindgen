@@ -36,6 +36,8 @@ impl PkgResolver {
     pub(crate) fn qualify_package(&mut self, this: &str, name: &str) -> String {
         if name != this {
             let imports = self.package_import.entry(this.to_string()).or_default();
+            let current_package_alias = this.rsplit('.').next().unwrap();
+            let _ = imports.ns.insert(current_package_alias);
             if let Some(alias) = imports.packages.get(name) {
                 format!("@{alias}.")
             } else {
@@ -416,6 +418,19 @@ mod tests {
         assert_eq!(
             packages.package_import["world.http-proxy"].packages[&interface],
             "leaf-interface"
+        );
+    }
+
+    #[test]
+    fn imported_alias_does_not_conflict_with_current_package() {
+        let mut packages = PkgResolver::default();
+        let current = "interface.golem.quota.types";
+        let dependency = "interface.golem.core.types";
+
+        assert_eq!(packages.qualify_package(current, dependency), "@types0.");
+        assert_eq!(
+            packages.package_import[current].packages[dependency],
+            "types0"
         );
     }
 }

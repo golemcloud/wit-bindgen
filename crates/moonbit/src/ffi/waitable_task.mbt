@@ -39,7 +39,7 @@ pub fn Task::new() -> Task {
 
 ///|
 pub fn Task::from_raw(raw : Int) -> Task {
-  guard raw != 0
+  guard! raw != 0
   context_set(raw)
   _async_debug("context-set(\{raw})")
   {

@@ -2,7 +2,7 @@ use anyhow::Result;
 use core::panic;
 use heck::{ToShoutySnakeCase, ToUpperCamelCase};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt::Write,
     mem,
     ops::Deref,
@@ -15,8 +15,8 @@ use wit_bindgen_core::{
     wit_parser::{
         Alignment, ArchitectureSize, Docs, Enum, Flags, FlagsRepr, Function, Int, InterfaceId,
         LiftLowerAbi, LiveTypes, ManglingAndAbi, Param, Record, Resolve, ResourceIntrinsic,
-        Result_, SizeAlign, Tuple, Type, TypeDefKind, TypeId, Variant, WasmExport, WasmExportKind,
-        WasmImport, WorldId, WorldKey,
+        Result_, SizeAlign, Tuple, Type, TypeDefKind, TypeId, TypeOwner, Variant, WasmExport,
+        WasmExportKind, WasmImport, WorldId, WorldItem, WorldKey,
     },
 };
 
@@ -102,7 +102,7 @@ impl Opts {
 struct InterfaceFragment {
     src: String,
     ffi: String,
-    builtins: HashSet<&'static str>,
+    builtins: BTreeSet<&'static str>,
 }
 
 impl InterfaceFragment {
@@ -113,11 +113,72 @@ impl InterfaceFragment {
     }
 }
 
+/// Sanitizes a WIT export identity into a stable MoonBit-identifier suffix used
+/// to disambiguate `wasmExport*` names that collide across the world's exports.
+/// `golem:agent/guest` -> `GolemAgentGuest`, world `agent-guest` -> `AgentGuest`.
+/// Any `@version` segment is stripped so the suffix does not change when a
+/// dependency is bumped.
+fn export_disambiguator(resolve: &Resolve, key: Option<&WorldKey>, world: WorldId) -> String {
+    let raw: String = match key {
+        Some(k) => resolve.name_world_key(k),
+        None => resolve.worlds[world].name.clone(),
+    };
+    let raw = match raw.rfind('@') {
+        Some(i) => &raw[..i],
+        None => raw.as_str(),
+    };
+    let mut out = String::new();
+    for part in raw.split([':', '/', '-', '_']) {
+        if part.is_empty() {
+            continue;
+        }
+        let mut chars = part.chars();
+        if let Some(c) = chars.next() {
+            out.push(c.to_ascii_uppercase());
+            out.push_str(chars.as_str());
+        }
+    }
+    out
+}
+
+/// Returns a stable identifier for a named aggregate's semantic WIT identity.
+///
+/// `TypeId` values reflect parser allocation order, so embedding them in
+/// generated helper names causes unrelated helpers to be renamed whenever a
+/// type is inserted earlier in the input. Records and variants are named WIT
+/// types, which lets their package/interface/type path provide a stable key.
+fn abi_helper_type_name(resolve: &Resolve, id: TypeId) -> String {
+    let ty = &resolve.types[id];
+    let owner = match ty.owner {
+        TypeOwner::Interface(owner) => resolve
+            .id_of(owner)
+            .unwrap_or_else(|| resolve.interfaces[owner].name.clone().unwrap()),
+        TypeOwner::World(owner) => resolve.worlds[owner].name.clone(),
+        TypeOwner::None => "anonymous".to_string(),
+    };
+    let identity = format!("{owner}/{}", ty.name.as_deref().unwrap());
+    let mut name = String::new();
+    let mut separator = false;
+    for ch in identity.chars() {
+        if ch.is_ascii_alphanumeric() {
+            name.push(ch.to_ascii_lowercase());
+            separator = false;
+        } else if !separator && !name.is_empty() {
+            name.push('_');
+            separator = true;
+        }
+    }
+    name.trim_end_matches('_').to_string()
+}
+
 #[derive(Default)]
 pub struct MoonBit {
     opts: Opts,
     project_name: String,
     import_world_fragment: InterfaceFragment,
+    export_lower_fragment: InterfaceFragment,
+    export_lower_helpers: BTreeMap<TypeId, String>,
+    export_lift_helpers: BTreeMap<TypeId, String>,
     sizes: SizeAlign,
 
     // Collision may happen when a package is imported with multiple versions.
@@ -126,14 +187,78 @@ pub struct MoonBit {
     // dependencies between packages
     pkg_resolver: PkgResolver,
     // Wasm export name -> (exported function name, func)
-    export: HashMap<String, (String, String)>,
+    export: BTreeMap<String, (String, String)>,
 
     export_ns: Ns,
+
+    /// Stable per-export disambiguators for `wasmExport*` names that collide
+    /// across the world's exports (e.g. `invoke` exported by both
+    /// `golem:agent/guest` and `golem:tool/guest`). Computed once in
+    /// `preprocess` from the exporting interface's identity, so the generated
+    /// names no longer depend on `world.exports` iteration order. Keyed by
+    /// `(interface key, function name)`; unique exports are absent.
+    disambiguators: HashMap<(Option<WorldKey>, String), String>,
 
     async_support: AsyncSupport,
 }
 
 impl MoonBit {
+    fn export_lower_package(&self) -> String {
+        format!("{}.wit_bindgen_export_lower", self.opts.r#gen_dir)
+    }
+
+    fn can_share_export_lower_helper(&self, resolve: &Resolve, ty: &Type) -> bool {
+        let Type::Id(id) = ty else { return true };
+        match &resolve.types[*id].kind {
+            TypeDefKind::Type(ty) => self.can_share_export_lower_helper(resolve, ty),
+            TypeDefKind::Record(record) => {
+                matches!(
+                    resolve.types[*id].owner,
+                    TypeOwner::Interface(owner)
+                        if self.pkg_resolver.import_interface_names.contains_key(&owner)
+                ) && record
+                    .fields
+                    .iter()
+                    .all(|field| self.can_share_export_lower_helper(resolve, &field.ty))
+            }
+            TypeDefKind::Variant(variant) => {
+                matches!(
+                    resolve.types[*id].owner,
+                    TypeOwner::Interface(owner)
+                        if self.pkg_resolver.import_interface_names.contains_key(&owner)
+                ) && variant.cases.iter().all(|case| {
+                    case.ty
+                        .as_ref()
+                        .is_none_or(|ty| self.can_share_export_lower_helper(resolve, ty))
+                })
+            }
+            TypeDefKind::List(ty)
+            | TypeDefKind::Option(ty)
+            | TypeDefKind::FixedLengthList(ty, _) => {
+                self.can_share_export_lower_helper(resolve, ty)
+            }
+            TypeDefKind::Tuple(tuple) => tuple
+                .types
+                .iter()
+                .all(|ty| self.can_share_export_lower_helper(resolve, ty)),
+            TypeDefKind::Result(result) => {
+                result
+                    .ok
+                    .as_ref()
+                    .is_none_or(|ty| self.can_share_export_lower_helper(resolve, ty))
+                    && result
+                        .err
+                        .as_ref()
+                        .is_none_or(|ty| self.can_share_export_lower_helper(resolve, ty))
+            }
+            TypeDefKind::Map(key, value) => {
+                self.can_share_export_lower_helper(resolve, key)
+                    && self.can_share_export_lower_helper(resolve, value)
+            }
+            _ => true,
+        }
+    }
+
     fn interface<'a>(
         &'a mut self,
         resolve: &'a Resolve,
@@ -149,15 +274,25 @@ impl MoonBit {
             resolve,
             name,
             direction,
-            ffi_imports: HashSet::new(),
+            ffi_imports: BTreeSet::new(),
             derive_opts,
             interface,
+            lower_helpers: BTreeMap::new(),
+            new_export_lower_helpers: BTreeSet::new(),
+            lift_helpers: BTreeMap::new(),
+            new_export_lift_helpers: BTreeSet::new(),
         }
     }
 
-    fn write_moon_pkg(&self, moon_pkg: &mut Source, imports: Option<&Imports>, link: bool) {
-        // Disable warning for invalid inline wasm
-        moon_pkg.push_str("{\n\"warn-list\": \"-44\"");
+    fn write_moon_pkg(
+        &self,
+        moon_pkg: &mut Source,
+        imports: Option<&Imports>,
+        link: bool,
+        wasm_only: bool,
+    ) {
+        // Inline Wasm and private canonical-ABI helpers are intentional in generated packages.
+        moon_pkg.push_str("{\n\"warn-list\": \"-44-unused_value-declaration_unimplemented\"");
         // Dependencies
         if let Some(imports) = imports {
             moon_pkg.push_str(",\n\"import\": [\n");
@@ -181,7 +316,7 @@ impl MoonBit {
         }
         let imports_async_core =
             imports.is_some_and(|imports| imports.packages.contains_key(ASYNC_CORE_DIR));
-        if imports_async_core || (link && self.async_support.is_required()) {
+        if wasm_only || imports_async_core || (link && self.async_support.is_required()) {
             moon_pkg.push_str(",\n\"supported-targets\": \"+wasm\"");
         }
         // Link target
@@ -263,6 +398,36 @@ impl WorldGenerator for MoonBit {
             }))
             .unwrap_or("generated".into());
         self.sizes.fill(resolve)?;
+
+        let mut groups: HashMap<String, Vec<(Option<WorldKey>, String)>> = HashMap::new();
+        for (key, item) in &resolve.worlds[world].exports {
+            match item {
+                WorldItem::Interface { id, .. } => {
+                    for (fname, _) in &resolve.interfaces[*id].functions {
+                        let base = format!("wasmExport{}", fname.to_upper_camel_case());
+                        groups
+                            .entry(base)
+                            .or_default()
+                            .push((Some(key.clone()), fname.clone()));
+                    }
+                }
+                WorldItem::Function(f) => {
+                    let base = format!("wasmExport{}", f.name.to_upper_camel_case());
+                    groups.entry(base).or_default().push((None, f.name.clone()));
+                }
+                WorldItem::Type { .. } => {}
+            }
+        }
+        let mut disambiguators = HashMap::new();
+        for entries in groups.values() {
+            if entries.len() > 1 {
+                for (key, fname) in entries {
+                    let disambig = export_disambiguator(resolve, key.as_ref(), world);
+                    disambiguators.insert((key.clone(), fname.clone()), disambig);
+                }
+            }
+        }
+        self.disambiguators = disambiguators;
         Ok(())
     }
 
@@ -285,6 +450,9 @@ impl WorldGenerator for MoonBit {
         for (_, func) in resolve.interfaces[id].functions.iter() {
             r#gen.import(func);
         }
+
+        r#gen.generate_lift_helper_bodies();
+        r#gen.generate_lower_helper_bodies();
 
         let fragment = r#gen.finish();
         // Write files
@@ -319,6 +487,7 @@ impl WorldGenerator for MoonBit {
                 &mut moon_pkg,
                 self.pkg_resolver.package_import.get(&name),
                 false,
+                false,
             );
             files.push(&format!("{directory}/moon.pkg.json"), moon_pkg.as_bytes());
         }
@@ -339,6 +508,9 @@ impl WorldGenerator for MoonBit {
         for (_, func) in funcs {
             r#gen.import(func);
         }
+
+        r#gen.generate_lift_helper_bodies();
+        r#gen.generate_lower_helper_bodies();
 
         let result = r#gen.finish();
         self.import_world_fragment.concat(result);
@@ -386,7 +558,7 @@ impl WorldGenerator for MoonBit {
         files.push(&format!("{directory}/import.mbt"), indent(&src).as_bytes());
         // FFI
         let mut ffi = Source::default();
-        let mut builtins: HashSet<&'static str> = HashSet::new();
+        let mut builtins: BTreeSet<&'static str> = BTreeSet::new();
         wit_bindgen_core::generated_preamble(&mut ffi, VERSION);
         uwriteln!(ffi, "{}", self.import_world_fragment.ffi);
         builtins.extend(self.import_world_fragment.builtins.iter());
@@ -402,6 +574,7 @@ impl WorldGenerator for MoonBit {
         self.write_moon_pkg(
             &mut moon_pkg,
             self.pkg_resolver.package_import.get(&name),
+            false,
             false,
         );
         files.push(&format!("{directory}/moon.pkg.json"), moon_pkg.as_bytes());
@@ -432,6 +605,9 @@ impl WorldGenerator for MoonBit {
             r#gen.export(func);
         }
 
+        r#gen.generate_lift_helper_bodies();
+        r#gen.generate_lower_helper_bodies();
+
         let fragment = r#gen.finish();
 
         // Write files
@@ -459,6 +635,7 @@ impl WorldGenerator for MoonBit {
                 self.write_moon_pkg(
                     &mut moon_pkg,
                     self.pkg_resolver.package_import.get(&name),
+                    false,
                     false,
                 );
                 files.push(&format!("{directory}/moon.pkg.json"), moon_pkg.as_bytes());
@@ -496,6 +673,9 @@ impl WorldGenerator for MoonBit {
             r#gen.export(func);
         }
 
+        r#gen.generate_lift_helper_bodies();
+        r#gen.generate_lower_helper_bodies();
+
         let fragment = r#gen.finish();
 
         // Write files
@@ -513,6 +693,7 @@ impl WorldGenerator for MoonBit {
                 self.write_moon_pkg(
                     &mut moon_pkg,
                     self.pkg_resolver.package_import.get(&name),
+                    false,
                     false,
                 );
                 files.push(&format!("{directory}/moon.pkg.json"), moon_pkg.as_bytes());
@@ -567,11 +748,36 @@ impl WorldGenerator for MoonBit {
             indent(&body).as_bytes(),
         );
 
+        if !self.export_lower_fragment.ffi.is_empty() {
+            let package = self.export_lower_package();
+            let directory = package.replace('.', "/");
+            let mut ffi = Source::default();
+            wit_bindgen_core::generated_preamble(&mut ffi, VERSION);
+            uwriteln!(ffi, "{}", self.export_lower_fragment.ffi);
+            for builtin in &self.export_lower_fragment.builtins {
+                uwriteln!(ffi, "{}", builtin);
+            }
+            files.push(&format!("{directory}/ffi.mbt"), indent(&ffi).as_bytes());
+
+            let mut package_file = Source::default();
+            self.write_moon_pkg(
+                &mut package_file,
+                self.pkg_resolver.package_import.get(&package),
+                false,
+                true,
+            );
+            files.push(
+                &format!("{directory}/moon.pkg.json"),
+                package_file.as_bytes(),
+            );
+        }
+
         let mut moon_pkg = Source::default();
         self.write_moon_pkg(
             &mut moon_pkg,
             self.pkg_resolver.package_import.get(&self.opts.r#gen_dir),
             true,
+            false,
         );
         files.push(
             &format!("{}/moon.pkg.json", self.opts.r#gen_dir),
@@ -586,7 +792,7 @@ struct InterfaceGenerator<'a> {
     src: String,
     ffi: String,
     // Collect of FFI imports used in this interface
-    ffi_imports: HashSet<&'static str>,
+    ffi_imports: BTreeSet<&'static str>,
 
     world_gen: &'a mut MoonBit,
     resolve: &'a Resolve,
@@ -597,6 +803,17 @@ struct InterfaceGenerator<'a> {
 
     // Options for deriving traits
     derive_opts: DeriveOpts,
+
+    // Shared lower-to-memory helper functions for named aggregate types
+    // (records/variants) reached from memory-lowered guest-export results. The
+    // helper for a given `TypeId` is emitted once and called from every
+    // `wasmExport*` glue function that lowers a value of that type, instead of
+    // inlining the full recursive lower at each call site. This keeps the
+    // generated `wasmExport*` functions small enough for `moonc` to compile.
+    lower_helpers: BTreeMap<TypeId, String>,
+    new_export_lower_helpers: BTreeSet<TypeId>,
+    lift_helpers: BTreeMap<TypeId, String>,
+    new_export_lift_helpers: BTreeSet<TypeId>,
 }
 
 impl InterfaceGenerator<'_> {
@@ -605,6 +822,396 @@ impl InterfaceGenerator<'_> {
             src: self.src,
             ffi: self.ffi,
             builtins: self.ffi_imports,
+        }
+    }
+
+    fn abi_helper_name(&self, operation: &str, id: TypeId, public: bool) -> String {
+        format!(
+            "{}wit_bindgen_{operation}_{}",
+            if public { "" } else { "__" },
+            abi_helper_type_name(self.resolve, id)
+        )
+    }
+
+    fn register_lift_helpers(&mut self, ty: &Type) {
+        let Type::Id(id) = ty else { return };
+        let id = *id;
+        match &self.resolve.types[id].kind {
+            TypeDefKind::Type(ty) => {
+                let ty = *ty;
+                self.register_lift_helpers(&ty);
+            }
+            TypeDefKind::Record(_) | TypeDefKind::Variant(_) => {
+                if self.lift_helpers.contains_key(&id) {
+                    return;
+                }
+                // Endpoint bridges carry function-specific intrinsic indices
+                // and cancellation state. Only their endpoint-free children
+                // can use context-free memory helpers.
+                if !type_contains_future_or_stream(self.resolve, ty) {
+                    let public = self.direction == Direction::Export
+                        && self
+                            .world_gen
+                            .can_share_export_lower_helper(self.resolve, &Type::Id(id));
+                    let name = if public {
+                        let helper_name = self.abi_helper_name("lift", id, true);
+                        if self
+                            .world_gen
+                            .export_lift_helpers
+                            .insert(id, helper_name.clone())
+                            .is_none()
+                        {
+                            self.new_export_lift_helpers.insert(id);
+                        }
+                        let package = self.world_gen.export_lower_package();
+                        format!(
+                            "{}{}",
+                            self.world_gen
+                                .pkg_resolver
+                                .qualify_package(self.name, &package),
+                            helper_name
+                        )
+                    } else {
+                        self.abi_helper_name("lift", id, false)
+                    };
+                    self.lift_helpers.insert(id, name);
+                }
+                let children: Vec<Type> = match &self.resolve.types[id].kind {
+                    TypeDefKind::Record(record) => {
+                        record.fields.iter().map(|field| field.ty).collect()
+                    }
+                    TypeDefKind::Variant(variant) => {
+                        variant.cases.iter().filter_map(|case| case.ty).collect()
+                    }
+                    _ => Vec::new(),
+                };
+                for child in children {
+                    self.register_lift_helpers(&child);
+                }
+            }
+            TypeDefKind::List(ty)
+            | TypeDefKind::Option(ty)
+            | TypeDefKind::FixedLengthList(ty, _) => {
+                let ty = *ty;
+                self.register_lift_helpers(&ty);
+            }
+            TypeDefKind::Tuple(tuple) => {
+                for ty in tuple.types.clone() {
+                    self.register_lift_helpers(&ty);
+                }
+            }
+            TypeDefKind::Result(result) => {
+                if let Some(ty) = result.ok {
+                    self.register_lift_helpers(&ty);
+                }
+                if let Some(ty) = result.err {
+                    self.register_lift_helpers(&ty);
+                }
+            }
+            TypeDefKind::Map(key, value) => {
+                let key = *key;
+                let value = *value;
+                self.register_lift_helpers(&key);
+                self.register_lift_helpers(&value);
+            }
+            _ => {}
+        }
+    }
+
+    /// Recursively registers a shared lower-to-memory helper for `ty` and
+    /// every named aggregate type (record/variant) reachable from it. Only
+    /// records names here; bodies are generated later by
+    /// [`Self::generate_lower_helper_bodies`].
+    ///
+    /// Mirrors the Rust backend's `register_lift_helpers`, but for the lower
+    /// side. Outlining the recursive lower into one helper per aggregate type
+    /// keeps the generated `wasmExport*` glue functions small enough for
+    /// `moonc` to compile (a single inlined lower of a deeply nested variant
+    /// can balloon the per-function IR past `moonc`'s limits).
+    fn register_lower_helpers(&mut self, ty: &Type) {
+        let Type::Id(id) = ty else { return };
+        let id = *id;
+        match &self.resolve.types[id].kind {
+            TypeDefKind::Type(t) => {
+                let t = *t;
+                self.register_lower_helpers(&t);
+            }
+            TypeDefKind::Record(_) | TypeDefKind::Variant(_) => {
+                if self.lower_helpers.contains_key(&id) {
+                    return;
+                }
+                if !type_contains_future_or_stream(self.resolve, ty) {
+                    let public = self.direction == Direction::Export
+                        && self
+                            .world_gen
+                            .can_share_export_lower_helper(self.resolve, &Type::Id(id));
+                    let name = if public {
+                        let helper_name = self.abi_helper_name("lower", id, true);
+                        if self
+                            .world_gen
+                            .export_lower_helpers
+                            .insert(id, helper_name.clone())
+                            .is_none()
+                        {
+                            self.new_export_lower_helpers.insert(id);
+                        }
+                        let package = self.world_gen.export_lower_package();
+                        format!(
+                            "{}{}",
+                            self.world_gen
+                                .pkg_resolver
+                                .qualify_package(self.name, &package),
+                            helper_name
+                        )
+                    } else {
+                        self.abi_helper_name("lower", id, false)
+                    };
+                    self.lower_helpers.insert(id, name);
+                }
+                // Collect child types first to avoid borrow conflicts.
+                let children: Vec<Type> = match &self.resolve.types[id].kind {
+                    TypeDefKind::Record(r) => r.fields.iter().map(|f| f.ty).collect(),
+                    TypeDefKind::Variant(v) => v.cases.iter().filter_map(|c| c.ty).collect(),
+                    _ => Vec::new(),
+                };
+                for child in children {
+                    self.register_lower_helpers(&child);
+                }
+            }
+            TypeDefKind::List(t) | TypeDefKind::Option(t) | TypeDefKind::FixedLengthList(t, _) => {
+                let t = *t;
+                self.register_lower_helpers(&t);
+            }
+            TypeDefKind::Tuple(tuple) => {
+                let tys: Vec<Type> = tuple.types.clone();
+                for t in tys {
+                    self.register_lower_helpers(&t);
+                }
+            }
+            TypeDefKind::Result(r) => {
+                if let Some(t) = r.ok {
+                    self.register_lower_helpers(&t);
+                }
+                if let Some(t) = r.err {
+                    self.register_lower_helpers(&t);
+                }
+            }
+            TypeDefKind::Map(k, v) => {
+                let k = *k;
+                let v = *v;
+                self.register_lower_helpers(&k);
+                self.register_lower_helpers(&v);
+            }
+            _ => {}
+        }
+    }
+
+    /// Generates the body of every registered lower helper into `self.ffi`.
+    ///
+    /// Each helper has the signature `fn name(ptr : Int, value : T) -> Unit` and
+    /// writes `value` to linear memory at `ptr` using the canonical ABI. The
+    /// root type is lowered inline (one level deep) via
+    /// [`abi::lower_to_memory_root`]; nested named aggregates are outlined
+    /// into calls to their own helpers.
+    fn generate_lower_helper_bodies_for(
+        &mut self,
+        ids: Vec<TypeId>,
+        package: &str,
+        public: bool,
+    ) -> String {
+        let resolve = self.resolve;
+        let mut output = String::new();
+        for id in ids {
+            let name = self.lower_helpers[&id].clone();
+            let ty = Type::Id(id);
+            let value_ty = self.world_gen.pkg_resolver.type_name(package, &ty);
+            let visibility = if public { "pub " } else { "" };
+
+            for borrowed in [false, true] {
+                // The helper body is generated in a borrow scope so that
+                // `FunctionBindgen`'s borrow of `self` ends before we write the
+                // finished body into `self.ffi` below.
+                let body = {
+                    // Reserve the helper's parameter names (`ptr`, `value`) in the
+                    // local namespace so that lowering temps such as the string /
+                    // canonical-list pointer (`locals.tmp("ptr")`) become `ptr0`,
+                    // `ptr1`, ... instead of `ptr`, which would shadow the `ptr`
+                    // parameter and make subsequent `(ptr) + offset` stores write
+                    // to the string's own buffer instead of the result base.
+                    let mut f = FunctionBindgen::new_with_context(
+                        self,
+                        Box::new([
+                            "ptr".to_string(),
+                            "value".to_string(),
+                            "cleanup_list".to_string(),
+                        ]),
+                        package,
+                        package,
+                    );
+                    f.borrowed_lower = borrowed;
+                    abi::lower_to_memory_root(
+                        resolve,
+                        &mut f,
+                        "ptr".to_string(),
+                        "value".to_string(),
+                        &ty,
+                        id,
+                        if borrowed {
+                            abi::Realloc::None
+                        } else {
+                            abi::Realloc::Export("cabi_realloc")
+                        },
+                    );
+                    if borrowed {
+                        for cleanup in mem::take(&mut f.cleanup) {
+                            uwriteln!(f.src, "cleanup_list.push({})", cleanup.address);
+                        }
+                    }
+                    let body = mem::take(&mut f.src);
+
+                    // A pure lower-to-memory of a record/variant allocates the
+                    // result buffers via `cabi_realloc` (handed off to the caller)
+                    // and must not require any of the side state that `export`
+                    // would otherwise flush into the surrounding function. Assert
+                    // the assumption holds rather than silently emitting broken
+                    // code if a future lower path starts depending on them.
+                    assert!(
+                        borrowed || !f.needs_cleanup_list,
+                        "outlined lower helper unexpectedly requires a cleanup list"
+                    );
+                    assert!(
+                        f.cleanup.is_empty(),
+                        "outlined lower helper unexpectedly produced cleanup entries"
+                    );
+                    body
+                };
+
+                let (name, cleanup) = if borrowed {
+                    (
+                        name.replace("wit_bindgen_lower_", "wit_bindgen_borrow_lower_"),
+                        ", cleanup_list : Array[Int]",
+                    )
+                } else {
+                    (name.clone(), "")
+                };
+                uwriteln!(
+                    output,
+                    "\n#doc(hidden)\n{visibility}fn {name}(ptr : Int, value : {value_ty}{cleanup}) -> Unit {{\n{body}\n}}\n"
+                );
+            }
+
+            // The memory owner frees buffers after the caller has consumed the
+            // result. Share the same type/package placement as owned lowering,
+            // but never reclaim handles which have transferred to the caller.
+            let mut f = FunctionBindgen::new_with_context(
+                self,
+                Box::new(["ptr".to_string()]),
+                package,
+                package,
+            );
+            f.outline_deallocations = true;
+            abi::deallocate_lists_from_memory_root(resolve, &mut f, "ptr".into(), id);
+            let body = mem::take(&mut f.src);
+            let name = name.replace("wit_bindgen_lower_", "wit_bindgen_deallocate_");
+            uwriteln!(
+                output,
+                "\n#doc(hidden)\n{visibility}fn {name}(ptr : Int) -> Unit {{\n{body}\n}}\n"
+            );
+        }
+        output
+    }
+
+    fn generate_lift_helper_bodies_for(
+        &mut self,
+        ids: Vec<TypeId>,
+        package: &str,
+        public: bool,
+    ) -> String {
+        let resolve = self.resolve;
+        let mut output = String::new();
+        for id in ids {
+            let name = self.lift_helpers[&id].clone();
+            let ty = Type::Id(id);
+            let value_ty = self.world_gen.pkg_resolver.type_name(package, &ty);
+            let (body, value) = {
+                let mut f = FunctionBindgen::new_with_context(
+                    self,
+                    Box::new(["ptr".to_string()]),
+                    package,
+                    package,
+                );
+                let value = abi::lift_from_memory_root(resolve, &mut f, "ptr".to_string(), &ty, id);
+                let body = mem::take(&mut f.src);
+                assert!(
+                    !f.needs_cleanup_list,
+                    "outlined lift helper unexpectedly requires a cleanup list"
+                );
+                assert!(
+                    f.cleanup.is_empty(),
+                    "outlined lift helper unexpectedly produced cleanup entries"
+                );
+                (body, value)
+            };
+            let visibility = if public { "pub " } else { "" };
+            uwriteln!(
+                output,
+                "\n#doc(hidden)\n{visibility}fn {name}(ptr : Int) -> {value_ty} {{\n{body}\n{value}\n}}\n"
+            );
+        }
+        output
+    }
+
+    fn generate_lift_helper_bodies(&mut self) {
+        let local_ids = self
+            .lift_helpers
+            .iter()
+            .filter_map(|(id, name)| (!name.starts_with('@')).then_some(*id))
+            .collect();
+        let package = self.name.to_string();
+        let local_bodies = self.generate_lift_helper_bodies_for(local_ids, &package, false);
+        self.ffi.push_str(&local_bodies);
+
+        if !self.new_export_lift_helpers.is_empty() {
+            let package = self.world_gen.export_lower_package();
+            let interface_helpers = mem::replace(
+                &mut self.lift_helpers,
+                self.world_gen.export_lift_helpers.clone(),
+            );
+            let ids = self.new_export_lift_helpers.iter().copied().collect();
+            let bodies = self.generate_lift_helper_bodies_for(ids, &package, true);
+            self.lift_helpers = interface_helpers;
+            self.world_gen.export_lower_fragment.ffi.push_str(&bodies);
+            self.world_gen
+                .export_lower_fragment
+                .builtins
+                .extend(self.ffi_imports.iter().copied());
+        }
+    }
+
+    fn generate_lower_helper_bodies(&mut self) {
+        let local_ids = self
+            .lower_helpers
+            .iter()
+            .filter_map(|(id, name)| (!name.starts_with('@')).then_some(*id))
+            .collect();
+        let package = self.name.to_string();
+        let local_bodies = self.generate_lower_helper_bodies_for(local_ids, &package, false);
+        self.ffi.push_str(&local_bodies);
+
+        if !self.new_export_lower_helpers.is_empty() {
+            let package = self.world_gen.export_lower_package();
+            let interface_helpers = mem::replace(
+                &mut self.lower_helpers,
+                self.world_gen.export_lower_helpers.clone(),
+            );
+            let ids = self.new_export_lower_helpers.iter().copied().collect();
+            let bodies = self.generate_lower_helper_bodies_for(ids, &package, true);
+            self.lower_helpers = interface_helpers;
+            self.world_gen.export_lower_fragment.ffi.push_str(&bodies);
+            self.world_gen
+                .export_lower_fragment
+                .builtins
+                .extend(self.ffi_imports.iter().copied());
         }
     }
 
@@ -619,6 +1226,14 @@ impl InterfaceGenerator<'_> {
         let endpoint_plan = self.import_async_function_plan(self.interface, func);
         let wasm_sig = self.resolve.wasm_signature(variant, func);
         let mbt_sig = self.world_gen.pkg_resolver.mbt_sig(self.name, func, false);
+
+        for param in &func.params {
+            self.register_lower_helpers(&param.ty);
+        }
+        if let Some(result) = &func.result {
+            self.register_lift_helpers(result);
+        }
+
         let (src, needs_cleanup_list, endpoint_state) = if async_plan.is_async() {
             let body = self.generate_async_import_body(&endpoint_plan, func, &mbt_sig, &wasm_sig);
             (body.src, body.needs_cleanup_list, body.state)
@@ -631,6 +1246,7 @@ impl InterfaceGenerator<'_> {
                     .collect(),
             )
             .with_async_state(endpoint_plan.state());
+            bindgen.borrowed_lower = true;
             if endpoint_plan.has_endpoints() {
                 bindgen = bindgen.with_sync_import_commit(
                     func.params.iter().map(|Param { ty, .. }| *ty).collect(),
@@ -712,16 +1328,32 @@ impl InterfaceGenerator<'_> {
         uwrite!(
             self.src,
             r#"
+            #warnings("-declaration_unimplemented")
             declare {func_sig}
             "#
         );
 
         let endpoint_plan = self.export_async_function_plan(self.interface, func);
+
+        for param in &func.params {
+            self.register_lift_helpers(&param.ty);
+        }
+
+        // Register shared lower-to-memory helpers for the named aggregate
+        // types reached from this export's result so that the recursive lower
+        // is outlined into per-type helpers instead of being inlined into the
+        // `wasmExport*` glue. Flat async results also contain memory-lowered
+        // list elements, despite not using a return pointer themselves.
+        if let Some(result) = &func.result {
+            self.register_lower_helpers(result);
+        }
+
         let mut bindgen = FunctionBindgen::new(
             self,
             (0..sig.params.len()).map(|i| format!("p{i}")).collect(),
         )
         .with_async_state(endpoint_plan.state());
+        bindgen.borrowed_lower = async_plan.is_async();
 
         abi::call(
             bindgen.interface_gen.resolve,
@@ -748,10 +1380,17 @@ impl InterfaceGenerator<'_> {
 
         let camel_name = func.name.to_upper_camel_case();
 
+        let disambig = self
+            .world_gen
+            .disambiguators
+            .get(&(self.interface.cloned(), func.name.to_string()))
+            .cloned()
+            .unwrap_or_default();
+
         let func_name = self
             .world_gen
             .export_ns
-            .tmp(&format!("wasmExport{camel_name}"));
+            .tmp(&format!("wasmExport{camel_name}{disambig}"));
 
         let params = sig
             .params
@@ -820,6 +1459,7 @@ impl InterfaceGenerator<'_> {
             self.interface,
             func,
             &camel_name,
+            &disambig,
             async_state,
         ) && abi::guest_export_needs_post_return(self.resolve, func)
         {
@@ -839,6 +1479,7 @@ impl InterfaceGenerator<'_> {
                 (0..sig.results.len()).map(|i| format!("p{i}")).collect(),
             );
 
+            bindgen.outline_deallocations = true;
             abi::post_return(bindgen.interface_gen.resolve, func, &mut bindgen);
 
             let src = bindgen.src;
@@ -846,7 +1487,7 @@ impl InterfaceGenerator<'_> {
             let func_name = self
                 .world_gen
                 .export_ns
-                .tmp(&format!("wasmExport{camel_name}PostReturn"));
+                .tmp(&format!("wasmExport{camel_name}{disambig}PostReturn"));
 
             uwrite!(
                 self.ffi,
@@ -980,16 +1621,16 @@ impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
         if self.derive_opts.derive_eq {
             deriviation.push("Eq")
         }
-        let declaration = if self.derive_opts.derive_error && name.contains("Error") {
-            "suberror"
+        let type_definition = if self.derive_opts.derive_error && name.contains("Error") {
+            format!("suberror {name} {{ {name}(Int) }}")
         } else {
-            "struct"
+            format!("struct {name}(Int)")
         };
 
         uwrite!(
             self.src,
             r#"
-            pub(all) {declaration} {name}(Int) derive({})
+            pub(all) {type_definition} derive({})
             "#,
             deriviation.join(", "),
         );
@@ -1074,6 +1715,7 @@ impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
                 &mut self.src,
                 r#"
                 /// Destructor of the resource.
+                #warnings("-declaration_unimplemented")
                 declare pub fn {name}::dtor(_self : {name}) -> Unit
                 "#
             );
@@ -1168,16 +1810,16 @@ impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
         if self.derive_opts.derive_eq {
             deriviation.push("Eq")
         }
-        let declaration = if self.derive_opts.derive_error && name.contains("Error") {
-            "suberror"
+        let type_definition = if self.derive_opts.derive_error && name.contains("Error") {
+            format!("suberror {name} {{ {name}({ty}) }}")
         } else {
-            "struct"
+            format!("struct {name}({ty})")
         };
 
         uwrite!(
             self.src,
             "
-            pub(all) {declaration} {name}({ty}) derive({})
+            pub(all) {type_definition} derive({})
             pub fn {name}::default() -> {name} {{
                 {}
             }}
@@ -1428,6 +2070,8 @@ struct FunctionBindgen<'a, 'b> {
     commit_endpoints: bool,
     sync_import_argument_types: Option<Vec<Type>>,
     async_state: AsyncFunctionState,
+    outline_deallocations: bool,
+    borrowed_lower: bool,
 }
 
 impl<'a, 'b> FunctionBindgen<'a, 'b> {
@@ -1435,15 +2079,24 @@ impl<'a, 'b> FunctionBindgen<'a, 'b> {
         r#gen: &'b mut InterfaceGenerator<'a>,
         params: Box<[String]>,
     ) -> FunctionBindgen<'a, 'b> {
+        let context = r#gen.name.to_string();
+        Self::new_with_context(r#gen, params, &context, &context)
+    }
+
+    fn new_with_context(
+        r#gen: &'b mut InterfaceGenerator<'a>,
+        params: Box<[String]>,
+        type_context: &str,
+        func_interface: &str,
+    ) -> FunctionBindgen<'a, 'b> {
         let mut locals = Ns::default();
         params.iter().for_each(|str| {
             locals.tmp(str);
         });
-        let type_context = r#gen.name.to_string();
         Self {
             interface_gen: r#gen,
-            func_interface: type_context.clone(),
-            type_context,
+            func_interface: func_interface.to_string(),
+            type_context: type_context.to_string(),
             params,
             src: String::new(),
             locals,
@@ -1458,6 +2111,8 @@ impl<'a, 'b> FunctionBindgen<'a, 'b> {
             commit_endpoints: false,
             sync_import_argument_types: None,
             async_state: AsyncFunctionState::default(),
+            outline_deallocations: false,
+            borrowed_lower: false,
         }
     }
 
@@ -2388,6 +3043,49 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                 ))
             }
 
+            Instruction::LiftNamedFromMemory { ty, offset } => {
+                let name = self
+                    .lift_helper_name(self.interface_gen.resolve, *ty)
+                    .expect("lift helper must be registered before it is emitted");
+                results.push(format!(
+                    "{name}(({}) + {offset})",
+                    operands[0],
+                    offset = offset.size_wasm32()
+                ));
+            }
+
+            Instruction::LowerNamedToMemory { ty, offset } => {
+                let mut name = self
+                    .lower_helper_name(self.interface_gen.resolve, *ty)
+                    .expect("lower helper must be registered before it is emitted");
+                let cleanup = if self.borrowed_lower {
+                    name = name.replace("wit_bindgen_lower_", "wit_bindgen_borrow_lower_");
+                    self.needs_cleanup_list = true;
+                    ", cleanup_list"
+                } else {
+                    ""
+                };
+                uwriteln!(
+                    self.src,
+                    "{name}(({}) + {offset}, {}{cleanup})",
+                    operands[1],
+                    operands[0],
+                    offset = offset.size_wasm32()
+                )
+            }
+
+            Instruction::DeallocateNamedFromMemory { ty, offset } => {
+                let name = self
+                    .deallocate_helper_name(self.interface_gen.resolve, *ty)
+                    .unwrap();
+                uwriteln!(
+                    self.src,
+                    "{name}(({}) + {})",
+                    operands[0],
+                    offset.size_wasm32()
+                );
+            }
+
             Instruction::I32Load8U { offset } => {
                 self.use_ffi(ffi::LOAD8_U);
                 results.push(format!(
@@ -2864,9 +3562,9 @@ impl Bindgen for FunctionBindgen<'_, '_> {
             "let {address} = mbt_ffi_malloc({})",
             size.size_wasm32(),
         );
-        // If the interface is an import, we need to track this for cleanup
-        // Otherwise, the caller is responsible for cleaning up in post_return
-        if self.interface_gen.direction == Direction::Import {
+        // Import scratch and async task.return areas are temporary. Only sync
+        // export return areas are transferred to post_return.
+        if self.interface_gen.direction == Direction::Import || self.borrowed_lower {
             self.cleanup.push(Cleanup {
                 address: address.clone(),
             });
@@ -2911,6 +3609,22 @@ impl Bindgen for FunctionBindgen<'_, '_> {
             element,
             Type::U8 | Type::U32 | Type::U64 | Type::S32 | Type::S64 | Type::F32 | Type::F64
         )
+    }
+
+    fn lift_helper_name(&self, _resolve: &Resolve, id: TypeId) -> Option<String> {
+        self.interface_gen.lift_helpers.get(&id).cloned()
+    }
+
+    fn lower_helper_name(&self, _resolve: &Resolve, id: TypeId) -> Option<String> {
+        self.interface_gen.lower_helpers.get(&id).cloned()
+    }
+
+    fn deallocate_helper_name(&self, resolve: &Resolve, id: TypeId) -> Option<String> {
+        if !self.outline_deallocations {
+            return None;
+        }
+        self.lower_helper_name(resolve, id)
+            .map(|name| name.replace("wit_bindgen_lower_", "wit_bindgen_deallocate_"))
     }
 }
 
@@ -3093,6 +3807,8 @@ fn world_contains_future_or_stream(resolve: &Resolve, world: WorldId) -> bool {
 fn indent(code: &str) -> Source {
     let mut indented = Source::default();
     let mut was_empty = false;
+    let mut depth = 0usize;
+    let mut has_top_level_separator = false;
     for line in code.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -3105,13 +3821,46 @@ fn indent(code: &str) -> Source {
         }
 
         if trimmed.starts_with('}') {
+            depth = depth.saturating_sub(1);
             indented.deindent(2)
+        }
+        let starts_declaration = [
+            "async fn ",
+            "declare ",
+            "enum ",
+            "extern ",
+            "fn ",
+            "impl ",
+            "let ",
+            "priv ",
+            "pub ",
+            "struct ",
+            "suberror ",
+            "type ",
+        ]
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix));
+        let starts_metadata = (trimmed.starts_with("///") && trimmed != "///|")
+            || (trimmed.starts_with('#') && !trimmed.starts_with("#|"));
+        if depth == 0 && starts_metadata && !has_top_level_separator {
+            indented.push_str("///|\n");
+            has_top_level_separator = true;
+        }
+        if depth == 0 && starts_declaration && !has_top_level_separator {
+            indented.push_str("///|\n");
+        }
+        if depth == 0 && starts_declaration {
+            has_top_level_separator = false;
         }
         indented.push_str(trimmed);
         if trimmed.ends_with('{') && !trimmed.starts_with("///") {
+            depth += 1;
             indented.indent(2)
         }
         indented.push_str("\n");
+        if depth == 0 && trimmed == "///|" {
+            has_top_level_separator = true;
+        }
     }
     indented
 }
@@ -3172,6 +3921,83 @@ mod tests {
         std::str::from_utf8(contents).unwrap()
     }
 
+    fn snapshot(files: &Files) -> Vec<(String, Vec<u8>)> {
+        files
+            .iter()
+            .map(|(name, contents)| (name.to_string(), contents.to_vec()))
+            .collect()
+    }
+
+    fn abi_helpers(source: &str) -> BTreeMap<String, String> {
+        let mut helpers = BTreeMap::new();
+        for marker in ["fn __wit_bindgen_", "fn wit_bindgen_"] {
+            let mut remaining = source;
+            while let Some(start) = remaining.find(marker) {
+                remaining = &remaining[start..];
+                let name_end = remaining.find('(').unwrap();
+                let name = remaining[3..name_end].to_string();
+                let body_start = remaining.find('{').unwrap();
+                let mut depth = 0;
+                let mut body_end = None;
+                for (offset, ch) in remaining[body_start..].char_indices() {
+                    match ch {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                body_end = Some(body_start + offset + 1);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let body_end = body_end.unwrap();
+                helpers.insert(name, remaining[..body_end].to_string());
+                remaining = &remaining[body_end..];
+            }
+        }
+        helpers
+    }
+
+    #[test]
+    fn generation_is_deterministic() {
+        let wit = r#"
+            package a:b;
+
+            interface api {
+                strings: func(value: string) -> string;
+                bytes: func(value: list<u8>) -> list<u8>;
+                unsigned-32s: func(value: list<u32>) -> list<u32>;
+                unsigned-64s: func(value: list<u64>) -> list<u64>;
+                signed-32s: func(value: list<s32>) -> list<s32>;
+                signed-64s: func(value: list<s64>) -> list<s64>;
+                floats: func(value: list<f32>) -> list<f32>;
+                doubles: func(value: list<f64>) -> list<f64>;
+            }
+
+            world runner {
+                import api;
+                export api;
+            }
+        "#;
+        let expected = snapshot(&generate(wit, "runner"));
+
+        for iteration in 0..16 {
+            let actual = snapshot(&generate(wit, "runner"));
+            assert_eq!(actual.len(), expected.len());
+            for ((actual_name, actual_contents), (expected_name, expected_contents)) in
+                actual.iter().zip(&expected)
+            {
+                assert_eq!(actual_name, expected_name);
+                assert!(
+                    actual_contents == expected_contents,
+                    "generated file `{actual_name}` changed on iteration {iteration}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn endpoint_free_sync_generation_matches_golden() {
         let files = generate(
@@ -3212,15 +4038,15 @@ mod tests {
         assert_eq!(
             fingerprints,
             vec![
-                ("gen/ffi.mbt".into(), 10220319382745692950),
-                ("gen/moon.pkg.json".into(), 15894505084782869543),
-                ("gen/world/runner/ffi.mbt".into(), 14715999128234894449),
-                ("gen/world/runner/moon.pkg.json".into(), 6361049410124596525,),
-                ("gen/world/runner/top.mbt".into(), 12192865914091673515,),
+                ("gen/ffi.mbt".into(), 3015121443139333543),
+                ("gen/moon.pkg.json".into(), 4016311361297189155),
+                ("gen/world/runner/ffi.mbt".into(), 7191242004779882714),
+                ("gen/world/runner/moon.pkg.json".into(), 6277720927474812145,),
+                ("gen/world/runner/top.mbt".into(), 6857206758629669597,),
                 ("moon.mod.json".into(), 14111159726816684443),
-                ("world/runner/ffi_import.mbt".into(), 17812050158059242657,),
+                ("world/runner/ffi_import.mbt".into(), 16979266963551268444,),
                 ("world/runner/import.mbt".into(), 5430383198437179961),
-                ("world/runner/moon.pkg.json".into(), 6361049410124596525,),
+                ("world/runner/moon.pkg.json".into(), 6277720927474812145,),
             ]
         );
     }
@@ -3430,6 +4256,45 @@ mod tests {
     }
 
     #[test]
+    fn generated_sources_use_current_moonbit_warning_safe_syntax() {
+        let mut opts = Opts {
+            gen_dir: "gen".into(),
+            ..Opts::default()
+        };
+        opts.derive.derive_error = true;
+        let files = try_generate_with_opts(
+            r#"
+                package a:b;
+
+                interface api {
+                    resource io-error;
+                    flags app-error { failed }
+                    use-types: func(value: borrow<io-error>, options: app-error);
+                }
+
+                world runner { import api; }
+            "#,
+            "runner",
+            opts,
+        )
+        .unwrap();
+
+        let source = file(&files, "interface/a/b/api/top.mbt");
+        assert!(
+            source.contains("suberror IoError { IoError(Int) }"),
+            "{source}"
+        );
+        assert!(
+            source.contains("suberror AppError { AppError(Byte) }"),
+            "{source}"
+        );
+        let ffi = file(&files, "interface/a/b/api/ffi.mbt");
+        assert!(ffi.contains("///|\nfn "), "{ffi}");
+        let package = file(&files, "interface/a/b/api/moon.pkg.json");
+        assert!(package.contains("-unused_value-declaration_unimplemented"));
+    }
+
+    #[test]
     fn sync_functions_with_endpoints_remain_sync() {
         let files = generate(
             r#"
@@ -3467,7 +4332,7 @@ mod tests {
     #[test]
     fn fixed_primitive_streams_use_four_kibibyte_buffer_budget() {
         for (wit_type, expected_window) in [
-            ("u8", 4096),
+            ("u8", 65536),
             ("s8", 4096),
             ("u16", 2048),
             ("s16", 2048),
@@ -3511,7 +4376,9 @@ mod tests {
             );
             let compact = generated.split_whitespace().collect::<Vec<_>>().join(" ");
             assert!(
-                compact.contains(&format!("Some(cleanup_value), {expected_window}, )")),
+                compact.contains(&format!(
+                    "Some(cleanup_value), write_window_size={expected_window}, )"
+                )),
                 "sink did not receive the {expected_window}-element window for {wit_type}: \
                  {generated}"
             );
@@ -3561,6 +4428,166 @@ mod tests {
             wrapper.contains("handle((p0).reinterpret_as_uint(), background_group0)"),
             "{wrapper}"
         );
+    }
+
+    #[test]
+    fn export_lower_helpers_are_shared_across_interfaces() {
+        let files = generate(
+            r#"
+            package test:shared-lowering;
+
+            interface types {
+                record shared {
+                    name: string,
+                    values: list<u32>,
+                }
+            }
+
+            interface first {
+                use types.{shared};
+                get-first: func(value: list<shared>) -> shared;
+            }
+
+            interface second {
+                use types.{shared};
+                get-second: func(value: list<shared>) -> shared;
+            }
+
+            world service {
+                import types;
+                export first;
+                export second;
+            }
+            "#,
+            "service",
+        );
+
+        let shared = file(&files, "gen/wit_bindgen_export_lower/ffi.mbt");
+        assert_eq!(shared.matches("pub fn wit_bindgen_lower_").count(), 1);
+        assert_eq!(shared.matches("pub fn wit_bindgen_lift_").count(), 1);
+
+        let first = file(&files, "gen/interface/test/shared-lowering/first/ffi.mbt");
+        let second = file(&files, "gen/interface/test/shared-lowering/second/ffi.mbt");
+        for wrapper in [first, second] {
+            assert!(wrapper.contains("@wit_bindgen_export_lower.wit_bindgen_lower_"));
+            assert!(wrapper.contains("@wit_bindgen_export_lower.wit_bindgen_lift_"));
+            assert!(!wrapper.contains("fn __wit_bindgen_lower_"));
+            assert!(!wrapper.contains("fn __wit_bindgen_lift_"));
+        }
+    }
+
+    #[test]
+    fn import_abi_helpers_are_reused_with_distinct_sync_and_async_ownership() {
+        let files = generate(
+            r#"
+            package test:import-helper-reuse;
+            interface api {
+                record leaf { name: string, tags: list<string> }
+                variant branch { leaf(leaf), children(list<leaf>), empty }
+                record schema-value-tree {
+                    root: branch,
+                    alternatives: list<branch>,
+                    metadata: list<tuple<string, string>>,
+                }
+                accept-first: func(values: list<schema-value-tree>);
+                accept-second: func(values: list<schema-value-tree>);
+                return-first: func() -> list<schema-value-tree>;
+                return-second: func() -> list<schema-value-tree>;
+                accept-later: async func(values: list<schema-value-tree>);
+            }
+            world service { import api; }
+            "#,
+            "service",
+        );
+        let ffi = file(&files, "interface/test/import-helper-reuse/api/ffi.mbt");
+        let api = file(&files, "interface/test/import-helper-reuse/api/top.mbt");
+        let suffix = "test_import_helper_reuse_api_schema_value_tree";
+        let borrowed = format!("__wit_bindgen_borrow_lower_{suffix}");
+        let owned = format!("__wit_bindgen_lower_{suffix}");
+        let lift = format!("__wit_bindgen_lift_{suffix}");
+
+        assert_eq!(ffi.matches(&format!("fn {borrowed}(")).count(), 1);
+        assert_eq!(ffi.matches(&format!("fn {owned}(")).count(), 1);
+        assert_eq!(ffi.matches(&format!("fn {lift}(")).count(), 1);
+        assert_eq!(api.matches(&format!("{borrowed}(")).count(), 2);
+        assert_eq!(api.matches(&format!("{owned}(")).count(), 1);
+        assert_eq!(api.matches(&format!("{lift}(")).count(), 2);
+        assert!(api.contains("cleanup_list.each(mbt_ffi_free)"), "{api}");
+    }
+
+    #[test]
+    fn inserting_a_variant_does_not_rename_or_rewrite_existing_helpers() {
+        let wit = |inserted: &str| {
+            format!(
+                r#"
+                package test:stable-helper-names;
+                interface api {{
+                    {inserted}
+                    record leaf {{ value: string }}
+                    variant branch {{ leaf(leaf), leaves(list<leaf>) }}
+                    record tree {{ branch: branch, siblings: list<branch> }}
+                    send: func(values: list<tree>) -> list<tree>;
+                }}
+                world service {{ import api; }}
+                "#
+            )
+        };
+        let baseline = generate(&wit(""), "service");
+        let inserted = generate(
+            &wit("variant unrelated { number(u32), text(string), empty }"),
+            "service",
+        );
+        let path = "interface/test/stable-helper-names/api/ffi.mbt";
+        let baseline_helpers = abi_helpers(file(&baseline, path));
+        let inserted_helpers = abi_helpers(file(&inserted, path));
+
+        assert!(!baseline_helpers.is_empty());
+        for (name, body) in baseline_helpers {
+            assert_eq!(inserted_helpers.get(&name), Some(&body), "helper {name}");
+        }
+    }
+
+    #[test]
+    fn async_only_results_share_helpers_and_keep_cleanup_in_task_return() {
+        let files = generate(
+            r#"
+            package test:async-lowering;
+            interface types {
+                record leaf { text: string, tags: list<string> }
+                record wide { a: leaf, b: leaf, c: leaf, d: leaf, e: leaf }
+            }
+            interface first {
+                use types.{leaf, wide};
+                get: async func() -> list<leaf>;
+                large: async func() -> wide;
+            }
+            interface second {
+                use types.{leaf};
+                get: async func() -> list<leaf>;
+            }
+            world service { import types; export first; export second; }
+            "#,
+            "service",
+        );
+        let shared = file(&files, "gen/wit_bindgen_export_lower/ffi.mbt");
+        assert_eq!(
+            shared.matches("pub fn wit_bindgen_borrow_lower_").count(),
+            2
+        );
+        assert!(shared.contains("cleanup_list.push(ptr0)"));
+        assert!(shared.contains("cleanup_list.push(address)"));
+        for interface in ["first", "second"] {
+            let wrapper = file(
+                &files,
+                &format!("gen/interface/test/async-lowering/{interface}/ffi.mbt"),
+            );
+            assert!(wrapper.contains("@wit_bindgen_export_lower.wit_bindgen_borrow_lower_"));
+            assert!(wrapper.contains("cleanup_list.push(address)"));
+            assert!(wrapper.contains("TaskReturn(address, (return_value).length())"));
+            assert!(wrapper.contains("cleanup_list.each(mbt_ffi_free)"));
+        }
+        let first = file(&files, "gen/interface/test/async-lowering/first/ffi.mbt");
+        assert!(first.contains("cleanup_list.push(return_area)"));
     }
 
     #[test]
@@ -3887,10 +4914,34 @@ mod tests {
         let event_loop = file(&files, "async-core/async_ev.mbt");
         assert!(
             event_loop.contains("let resolution = task_state.resolution")
-                && event_loop.contains("guard resolution is Resolved")
-                && !event_loop.contains("abort("),
+                && event_loop.contains("if !(resolution is Resolved)")
+                && event_loop.contains("abort(\"async export failed before task return\")")
+                && event_loop
+                    .contains("abort(\"component task-owned coroutine failed after cleanup\")")
+                && event_loop
+                    .contains("Cancelled::Cancelled as err if is_being_cancelled() => raise err")
+                && event_loop.contains("begin_owned_failure_drain(task_state, coro)")
+                && event_loop.contains("task_state.owned_failure = true")
+                && event_loop.contains("task_state.task.cancel()")
+                && event_loop.contains("task_state.owned_coroutines.each(fn(coro)")
+                && event_loop.contains("task_state.cancellation_pending = true")
+                && event_loop.contains("task_state.cancellation_requested = true")
+                && event_loop
+                    .contains("task_state.owned_failure || task_state.cancellation_requested"),
             "{event_loop}"
         );
+        let terminal = event_loop
+            .find("if task_state.task.state is (Done | Fail(_)) && no_more_work(task_state.lane)")
+            .unwrap();
+        let terminal = &event_loop[terminal..];
+        let snapshot = terminal.find("let owned_failed =").unwrap();
+        let finish = terminal
+            .find("finish_waitableset(waitable_set, task_state)")
+            .unwrap();
+        let abort = terminal
+            .find("abort(\"component task-owned coroutine failed after cleanup\")")
+            .unwrap();
+        assert!(snapshot < finish && finish < abort, "{terminal}");
     }
 
     #[test]
@@ -3927,6 +4978,96 @@ mod tests {
             ),
             "{event_loop}"
         );
+    }
+
+    #[test]
+    fn lowered_lazy_stream_producer_preserves_terminal_outcomes() {
+        let files = generate(
+            r#"
+            package test:stream-outcomes;
+            world service { export produce: async func() -> stream<u32>; }
+            "#,
+            "service",
+        );
+
+        let ffi = file(&files, "gen/world/service/ffi.mbt");
+        let async_trait = file(&files, "async-core/async_trait.mbt");
+        assert!(
+            ffi.contains("producer(sink)") && ffi.contains("sink.close()"),
+            "normal producer return must close the stream: {ffi}"
+        );
+        assert!(
+            async_trait.contains(
+                "defer {\n              sink.close() catch {\n                _ => ()\n              }\n            }\n            producer(sink)"
+            ),
+            "local producer cleanup must close without swallowing its outcome: {async_trait}"
+        );
+        assert!(
+            ffi.contains("errdefer {")
+                && ffi.contains("run_producer()")
+                && ffi.contains("close_writer_serialized()")
+                && !ffi.contains("run_producer() catch {"),
+            "producer failure and cancellation must clean up and propagate: {ffi}"
+        );
+        let failure = &ffi[ffi.find("errdefer {").unwrap()..];
+        let reject = failure.find("() => stream.reject(cleanup_value)").unwrap();
+        let close = failure.find("() => close_writer_serialized()").unwrap();
+        let producer = failure.find("run_producer()").unwrap();
+        assert!(
+            reject < close && close < producer,
+            "relay rejection and serialized close must guard producer failure: {failure}"
+        );
+        assert!(
+            ffi.contains("let mut total = 0")
+                && ffi.contains("while total < data_len")
+                && ffi.contains("settle_staging(total)"),
+            "accepted writes must retain exact back-pressure and staging cleanup: {ffi}"
+        );
+    }
+
+    #[test]
+    fn byte_stream_windows_are_bounded_before_copying() {
+        // Match the WASI filesystem write-via-stream direction: an imported
+        // resource method consumes the caller's stream<u8>.
+        let files = generate(
+            r#"
+            package wasi:filesystem@0.3.0;
+            interface types {
+                type byte = u8;
+                resource descriptor {
+                    write-via-stream: async func(data: stream<u8>) -> u64;
+                    write-alias: async func(data: stream<byte>) -> u64;
+                    write-words: async func(data: stream<u64>) -> u64;
+                }
+            }
+            world service { import types; }
+            "#,
+            "service",
+        );
+        let ffi = file(&files, "interface/wasi/filesystem/types/ffi.mbt");
+        assert_eq!(ffi.matches("write_window_size=65536").count(), 2);
+        assert_eq!(
+            ffi.matches("let data_len = if data.length() < 65536")
+                .count(),
+            2
+        );
+        assert_eq!(ffi.matches("write_window_size=512").count(), 1);
+        assert!(ffi.contains("[async-lower][stream-write-0][method]descriptor.write-via-stream"));
+        assert!(ffi.contains("ptr + total * 1"));
+        assert!(ffi.contains("data_len - total"));
+
+        let runtime = file(&files, "async-core/async_trait.mbt");
+        for (method, copy) in [
+            ("Sink::write(self", "FixedArray::from_array(data[:length])"),
+            ("Sink::write_bytes(self", "data[:length].to_fixedarray()"),
+        ] {
+            let body = &runtime[runtime.find(method).unwrap()..];
+            let cap = body
+                .find("let length = if data.length() < self.write_window_size")
+                .unwrap();
+            let copy = body.find(copy).unwrap();
+            assert!(cap < copy);
+        }
     }
 
     #[test]
@@ -3982,5 +5123,47 @@ mod tests {
         assert!(ffi.contains(r#""$root" "[future-new-unit]exchange""#));
         assert!(ffi.contains(r#""$root" "[async-lower][future-read-unit]exchange""#));
         assert!(ffi.contains(r#""$root" "[future-cancel-read-unit]exchange""#));
+    }
+
+    #[test]
+    fn post_return_helpers_share_resource_graphs_without_dropping_handles() {
+        let files = generate(
+            r#"
+            package test:cleanup;
+            interface model {
+                resource token;
+                record leaf { token: own<token>, name: string }
+                type alias = leaf;
+                record graph { leaves: list<alias>, suffix: string }
+            }
+            interface first {
+                use model.{graph};
+                get: func() -> graph;
+                get-again: func() -> result<graph, graph>;
+            }
+            interface second {
+                use model.{graph};
+                get: func() -> graph;
+            }
+            world service { import model; export first; export second; }
+            "#,
+            "service",
+        );
+        let shared = file(&files, "gen/wit_bindgen_export_lower/ffi.mbt");
+        assert_eq!(shared.matches("fn wit_bindgen_deallocate_").count(), 2);
+        for helper in shared.split("fn wit_bindgen_deallocate_").skip(1) {
+            let body = helper.split("\n}\n").next().unwrap();
+            assert!(!body.contains(".drop("), "{body}");
+            assert!(!body.contains(".drop_sync("), "{body}");
+            assert!(body.contains("mbt_ffi_free"), "{body}");
+        }
+        for interface in ["first", "second"] {
+            let ffi = file(
+                &files,
+                &format!("gen/interface/test/cleanup/{interface}/ffi.mbt"),
+            );
+            assert!(ffi.contains(".wit_bindgen_deallocate_"), "{ffi}");
+            assert!(!ffi.contains("fn __wit_bindgen_deallocate_"), "{ffi}");
+        }
     }
 }

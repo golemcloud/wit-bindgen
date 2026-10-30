@@ -843,6 +843,7 @@ impl<'a> InterfaceGenerator<'a> {
         interface: Option<&WorldKey>,
         func: &Function,
         camel_name: &str,
+        disambig: &str,
         async_state: AsyncFunctionState,
     ) -> bool {
         if !plan.is_async() {
@@ -852,7 +853,7 @@ impl<'a> InterfaceGenerator<'a> {
         let export_func_name = self
             .world_gen
             .export_ns
-            .tmp(&format!("wasmExportAsync{camel_name}"));
+            .tmp(&format!("wasmExportAsync{camel_name}{disambig}"));
         let AsyncTaskReturnState::Emitted {
             body: task_return_body,
             needs_cleanup_list: task_return_needs_cleanup,
@@ -1257,15 +1258,29 @@ impl<'a> InterfaceGenerator<'a> {
             .map(|ty| self.world_gen.sizes.size(ty).size_wasm32())
             .unwrap_or(0);
         let read_chunk_owns_buffer = result_type.is_some_and(|ty| self.is_list_canonical(ty));
-        let primitive_window = result_type
-            .filter(|ty| is_fixed_primitive(self.resolve, ty))
-            .map(|_| (PRIMITIVE_STREAM_BUFFER_BYTES / elem_size).max(1));
+        // Byte streams use a 64 KiB window; other fixed primitives use 4 KiB.
+        // Aggregates retain the conservative element cap and byte budget,
+        // while nested endpoints are serialized.
+        let mut payload = result_type.copied();
+        while let Some(Type::Id(id)) = payload {
+            match self.resolve.types[id].kind {
+                TypeDefKind::Type(ty) => payload = Some(ty),
+                _ => break,
+            }
+        }
+        let element_limit = if payload == Some(Type::U8) {
+            65536
+        } else if result_type.is_some_and(|ty| is_fixed_primitive(self.resolve, ty)) {
+            (PRIMITIVE_STREAM_BUFFER_BYTES / elem_size).max(1)
+        } else {
+            DEFAULT_STREAM_WINDOW_ELEMENTS
+        };
+        let max_read_count = element_limit.min((65536 / elem_size.max(1)).max(1));
         let staging_window = if payload_sites.is_empty() {
-            primitive_window.unwrap_or(DEFAULT_STREAM_WINDOW_ELEMENTS)
+            max_read_count
         } else {
             1
         };
-        let max_read_count = primitive_window.unwrap_or(DEFAULT_STREAM_WINDOW_ELEMENTS);
 
         let EndpointPayloadFragments {
             lift,
@@ -1326,7 +1341,7 @@ impl<'a> InterfaceGenerator<'a> {
                 lift_result: String::new(),
                 lower: "ignore((ptr, value))".into(),
                 malloc: "let ptr = 0".into(),
-                lift_list: "FixedArray::make(length, Unit::default())".into(),
+                lift_list: "FixedArray::make(length, Default::default())".into(),
                 commit: String::new(),
                 reject: String::new(),
                 free_outer: "ignore(ptr)".into(),
@@ -1413,6 +1428,7 @@ impl<'a> InterfaceGenerator<'a> {
             .then(|| {
                 format!(
                     r#"
+                    #warnings("-unused_value")
                     fn wasmImport{symbol_name}DropReadable(handle : Int) = "{drop_readable_module}" "{drop_readable_field}"
                     "#
                 )
@@ -1505,7 +1521,7 @@ fn wasm{symbol_name}FutureRejectPrepared(handle : Int) -> Bool {{
                         wasmImport{symbol_name}Write(writer, ptr),
                     )
                 }}
-                guard terminal.val is Some(transferred)
+                guard! terminal.val is Some(transferred)
                 if transferred {{
                     abort("rejected component future unexpectedly transferred a value")
                 }}
@@ -1634,17 +1650,11 @@ async fn Wasm{symbol_name}FutureSource::read(
     self.read_buffer = ptr
     self.read_discarding = false
     self.read_cleanup_done = false
-    {ffi}suspend_for_future_read(
-        self.handle,
-        wasmImport{symbol_name}Read(self.handle, ptr),
-    ) catch {{
-        err => {{
-            if self.read_discarding {{
-                self.wait_for_read_cleanup()
-                self.finish_read()
-                raise {ffi}FutureReadError::Dropped
-            }}
-            if err is {ffi}Cancelled::Cancelled {{
+    let discarded = Ref(false)
+    let read_result = try {{
+        errdefer {{
+            discarded.val = self.read_discarding
+            if {ffi}is_being_cancelled() {{
                 self.cancel_active_read()
                 if !self.closed {{
                     self.closed = true
@@ -1652,8 +1662,19 @@ async fn Wasm{symbol_name}FutureSource::read(
                 }}
             }}
             self.finish_read()
-            raise err
         }}
+        let result = {ffi}suspend_for_future_read(
+            self.handle,
+            wasmImport{symbol_name}Read(self.handle, ptr),
+        )
+        Ok(result)
+    }} catch {{
+        err => Err(err)
+    }}
+    match read_result {{
+        Ok(_) => ()
+        Err(_) if discarded.val => raise {ffi}FutureReadError::Dropped
+        Err(err) => raise err
     }}
     if self.read_discarding {{
         self.wait_for_read_cleanup()
@@ -1669,6 +1690,7 @@ async fn Wasm{symbol_name}FutureSource::read(
     value
 }}
 
+#warnings("-unused_value")
 fn wasm{symbol_name}FutureLift(handle : Int) -> {ffi}Future[{result}] {{
     let source = Wasm{symbol_name}FutureSource::{{
         handle,
@@ -1738,7 +1760,7 @@ fn wasm{symbol_name}FutureCommit(handle : Int) -> Unit {{
                         wasmImport{symbol_name}Write(writer, ptr),
                     )
                 }}
-                guard terminal.val is Some(transferred)
+                guard! terminal.val is Some(transferred)
                 if transferred {{
                     wasm{symbol_name}Commit(ptr, 0, 1)
                 }} else {{
@@ -1948,17 +1970,11 @@ async fn Wasm{symbol_name}StreamSource::read(
     self.read_buffer = ptr
     self.read_discarding = false
     self.read_cleanup_done = false
-    let (progress, end) = {ffi}suspend_for_stream_read(
-        self.handle,
-        wasmImport{symbol_name}Read(self.handle, ptr, read_count),
-    ) catch {{
-        err => {{
-            if self.read_discarding {{
-                self.wait_for_read_cleanup()
-                self.finish_read()
-                return None
-            }}
-            if err is {ffi}Cancelled::Cancelled {{
+    let discarded = Ref(false)
+    let read_result = try {{
+        errdefer {{
+            discarded.val = self.read_discarding
+            if {ffi}is_being_cancelled() {{
                 self.cancel_active_read()
                 if !self.closed {{
                     self.closed = true
@@ -1966,8 +1982,19 @@ async fn Wasm{symbol_name}StreamSource::read(
                 }}
             }}
             self.finish_read()
-            raise err
         }}
+        let result = {ffi}suspend_for_stream_read(
+            self.handle,
+            wasmImport{symbol_name}Read(self.handle, ptr, read_count),
+        )
+        Ok(result)
+    }} catch {{
+        err => Err(err)
+    }}
+    let (progress, end) = match read_result {{
+        Ok(result) => result
+        Err(_) if discarded.val => return None
+        Err(err) => raise err
     }}
     if self.read_discarding {{
         self.wait_for_read_cleanup()
@@ -1991,6 +2018,7 @@ async fn Wasm{symbol_name}StreamSource::read(
     Some(values)
 }}
 
+#warnings("-unused_value")
 fn wasm{symbol_name}StreamLift(handle : Int) -> {ffi}Stream[{result}] {{
     let source = Wasm{symbol_name}StreamSource::{{
         handle,
@@ -2135,7 +2163,7 @@ fn wasm{symbol_name}StreamCommit(handle : Int) -> Unit {{
             () => close_writer_serialized(),
             () => !writer_closed.val,
             Some(cleanup_value),
-            {staging_window},
+            write_window_size={staging_window},
         )
         let relay_source = producer is None
         let run_producer = async fn() -> Unit {{
@@ -2160,17 +2188,21 @@ fn wasm{symbol_name}StreamCommit(handle : Int) -> Unit {{
                     }}
             }}
         }}
-        run_producer() catch {{
-            _ =>
-                if relay_source {{
-                    {ffi}protect_from_cancel(
-                        () => stream.reject(cleanup_value),
-                        resume_on_cancel=true,
-                    ) catch {{
-                        _ => ()
-                    }}
+        errdefer {{
+            if relay_source {{
+                {ffi}protect_from_cancel(
+                    () => stream.reject(cleanup_value),
+                    resume_on_cancel=true,
+                ) catch {{
+                    _ => ()
                 }}
+            }}
+            {ffi}protect_from_cancel(
+                () => close_writer_serialized(),
+                resume_on_cancel=true,
+            )
         }}
+        run_producer()
         // A retained Sink may still own an in-flight canonical write after its
         // producer returns. Do not drop the writable endpoint until that write
         // has reached a terminal event and released its staging buffer.
@@ -2589,6 +2621,14 @@ impl<'a, 'b> FunctionBindgen<'a, 'b> {
     }
 
     pub(super) fn capture_task_return(&mut self, params: &[WasmType], operands: &[String]) {
+        // Flat results can allocate outside a variant/list element block, so
+        // finish_block has not yet added their outer buffers to this list.
+        if !self.cleanup.is_empty() {
+            self.needs_cleanup_list = true;
+            for cleanup in mem::take(&mut self.cleanup) {
+                uwriteln!(self.src, "cleanup_list.push({})", cleanup.address);
+            }
+        }
         let (body, needs_cleanup_list, return_param, return_value) =
             match &mut self.async_state.task_return {
                 AsyncTaskReturnState::Generating {

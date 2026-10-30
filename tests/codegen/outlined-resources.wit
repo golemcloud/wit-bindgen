@@ -1,0 +1,34 @@
+package test:outlined-resources;
+
+interface model {
+  resource token;
+  record leaf { token: own<token>, text: string, valid: char }
+  variant node { empty, leaves(list<leaf>), endpoint(stream<u8>), pending(future<leaf>) }
+  type alias = node;
+  record graph { prefix: string, nodes: list<alias>, suffix: string }
+  record borrowed { token: borrow<token>, value: graph }
+  accept: func(value: borrowed);
+}
+
+interface first {
+  use model.{graph};
+  get: func() -> graph;
+  get-again: func() -> result<graph, graph>;
+  get-later: async func() -> graph;
+  consume: async func(value: graph, other: graph);
+}
+
+interface second {
+  use model.{graph};
+  get: func() -> graph;
+  consume: async func(value: graph, other: graph);
+  resource local;
+  record leaf { token: own<local>, text: string, valid: char }
+  echo: func(value: list<leaf>) -> list<leaf>;
+}
+
+world test {
+  import model;
+  export first;
+  export second;
+}

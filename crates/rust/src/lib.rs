@@ -424,6 +424,11 @@ impl RustWasm {
             return_pointer_area_align: Default::default(),
             needs_runtime_module: false,
             needs_wit_map: false,
+            lift_helpers: Default::default(),
+            lift_helper_bodies: Default::default(),
+            lower_helpers: Default::default(),
+            borrowed_lower_helpers: Default::default(),
+            deallocate_helpers: Default::default(),
         })
     }
 

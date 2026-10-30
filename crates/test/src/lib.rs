@@ -198,6 +198,9 @@ struct Component {
 
     /// Runtime flags to wasmtime.
     wasmtime_flags: config::StringList,
+
+    /// Expected text when execution of this component's runtime case fails.
+    runtime_failure: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -476,6 +479,7 @@ impl Runner {
             contents,
             lang_config: config.lang,
             wasmtime_flags: config.wasmtime_flags,
+            runtime_failure: config.runtime_failure.into(),
         })
     }
 
@@ -775,9 +779,38 @@ impl Runner {
                     let runner_path = runner_path.to_path_buf();
                     let case = tests[case_name.as_str()].clone();
                     Trial::test(&name, move || {
+                        let expected_failure = [&runner]
+                            .into_iter()
+                            .chain(test_components.iter().map(|(component, _)| component))
+                            .flat_map(|component| component.runtime_failure.iter())
+                            .map(String::as_str)
+                            .collect::<Vec<_>>();
                         let result = me
                             .runtime_test(&case, &runner, &runner_path, &test_components)
                             .with_context(|| format!("failed to run `{}`", case.name));
+                        let result = if expected_failure.is_empty() {
+                            result
+                        } else {
+                            match result {
+                                Ok(()) => Err(anyhow::anyhow!(
+                                    "runtime test succeeded instead of failing with all of {expected_failure:?}"
+                                )),
+                                Err(error) => {
+                                    let message = format!("{error:#}");
+                                    let missing = expected_failure
+                                        .iter()
+                                        .filter(|expected| !message.contains(*expected))
+                                        .collect::<Vec<_>>();
+                                    if missing.is_empty() {
+                                        Ok(())
+                                    } else {
+                                        Err(error.context(format!(
+                                            "runtime failure did not contain {missing:?}"
+                                        )))
+                                    }
+                                }
+                            }
+                        };
                         me.render_error(
                             StepResult::new(result)
                                 .metadata("runner", runner.path.display())

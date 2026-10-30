@@ -3574,6 +3574,17 @@ impl<'a, 'b> Bindgen for FunctionBindgen<'a, 'b> {
             abi::Instruction::LengthLoad { offset } => {
                 self.load("size_t", *offset, operands, results)
             }
+            abi::Instruction::LiftNamedFromMemory { .. } => unreachable!(
+                "LiftNamedFromMemory is only emitted by generators that implement \
+                 Bindgen::lift_helper_name, which this generator does not"
+            ),
+            abi::Instruction::DeallocateNamedFromMemory { .. } => {
+                unreachable!("cleanup outlining is disabled")
+            }
+            abi::Instruction::LowerNamedToMemory { .. } => unreachable!(
+                "LowerNamedToMemory is only emitted by generators that implement \
+                 Bindgen::lower_helper_name, which this generator does not"
+            ),
             abi::Instruction::PointerStore { offset } => {
                 let ptr_type = self.r#gen.r#gen.opts.ptr_type();
                 self.store(ptr_type, *offset, operands)

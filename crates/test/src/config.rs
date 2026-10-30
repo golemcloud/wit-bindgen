@@ -69,6 +69,11 @@ pub struct RuntimeTestConfig<T = HashMap<String, toml::Value>> {
     #[serde(default)]
     pub wasmtime_flags: StringList,
 
+    /// Expected substrings in a runtime failure. When configured, successful
+    /// execution or a failure missing any of this text fails the test.
+    #[serde(default)]
+    pub runtime_failure: StringList,
+
     /// Language-specific configuration
     //
     // Note that this is an `Option<T>` where `T` defaults to a catch-all hash

@@ -3927,6 +3927,17 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                 self.load("uint8_t *", *offset, operands, results)
             }
             Instruction::LengthLoad { offset } => self.load("size_t", *offset, operands, results),
+            Instruction::LiftNamedFromMemory { .. } => unreachable!(
+                "LiftNamedFromMemory is only emitted by generators that implement \
+                 Bindgen::lift_helper_name, which this generator does not"
+            ),
+            Instruction::DeallocateNamedFromMemory { .. } => {
+                unreachable!("cleanup outlining is disabled")
+            }
+            Instruction::LowerNamedToMemory { .. } => unreachable!(
+                "LowerNamedToMemory is only emitted by generators that implement \
+                 Bindgen::lower_helper_name, which this generator does not"
+            ),
             Instruction::I32Store { offset } => self.store("int32_t", *offset, operands),
             Instruction::I64Store { offset } => self.store("int64_t", *offset, operands),
             Instruction::F32Store { offset } => self.store("float", *offset, operands),

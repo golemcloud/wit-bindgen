@@ -22,6 +22,8 @@ priv struct ComponentTaskState {
   owned_coroutines : @set.Set[Coroutine]
   mut resolution : TaskResolution
   mut cancellation_pending : Bool
+  mut cancellation_requested : Bool
+  mut owned_failure : Bool
 }
 
 ///|
@@ -87,6 +89,27 @@ fn acknowledge_cancellation(task_state : ComponentTaskState) -> Unit {
 }
 
 ///|
+/// Drain runtime-owned work before trapping. Only a host cancellation request
+/// may acknowledge cancellation with `task_cancel`.
+fn begin_owned_failure_drain(
+  task_state : ComponentTaskState,
+  failed : Coroutine,
+) -> Unit {
+  if task_state.owned_failure {
+    return
+  }
+  task_state.owned_failure = true
+  if !physical_equal(task_state.task, failed) {
+    task_state.task.cancel()
+  }
+  task_state.owned_coroutines.each(fn(coro) {
+    if !physical_equal(coro, failed) {
+      coro.cancel()
+    }
+  })
+}
+
+///|
 fn notify_subscriber(
   task_state : ComponentTaskState,
   waitable_id : Int,
@@ -122,8 +145,19 @@ fn next_callback(
   acknowledge_cancellation(task_state)
   if task_state.task.state is (Done | Fail(_)) && no_more_work(task_state.lane) {
     let resolution = task_state.resolution
+    let owned_failed = task_state.owned_failure
+    let failed = task_state.task.state is Fail(_)
     finish_waitableset(waitable_set, task_state)
-    guard resolution is Resolved
+    if owned_failed {
+      abort("component task-owned coroutine failed after cleanup")
+    }
+    if !(resolution is Resolved) {
+      if failed {
+        abort("async export failed before task return")
+      } else {
+        abort("async export completed without task return")
+      }
+    }
     return CallbackCode::Completed.encode()
   }
   if has_immediately_ready_task(task_state.lane) {
@@ -158,6 +192,8 @@ pub fn with_waitableset(f : async () -> Unit) -> Int {
     owned_coroutines: Set([]),
     resolution: Pending,
     cancellation_pending: false,
+    cancellation_requested: false,
+    owned_failure: false,
   }
   component_tasks.set(waitable_set, task_state)
   reschedule(lane)
@@ -200,6 +236,7 @@ pub fn cb(event : Int, waitable_id : Int, code : Int) -> Int {
     }
     TaskCancelled => {
       task_state.cancellation_pending = true
+      task_state.cancellation_requested = true
       task_state.task.cancel()
       task_state.owned_coroutines.each(Coroutine::cancel)
       reschedule(task_state.lane)
@@ -233,12 +270,21 @@ pub fn spawn_component_task_current(f : async () -> Unit) -> Unit {
     async fn() -> Unit {
       let coro = current_coroutine()
       defer task_state.owned_coroutines.remove(coro)
-      f()
+      f() catch {
+        Cancelled::Cancelled as err if is_being_cancelled() => raise err
+        err => {
+          begin_owned_failure_drain(task_state, coro)
+          raise err
+        }
+      }
     },
     task_state.lane,
     Some(spawn_component_task_current),
   )
   task_state.owned_coroutines.add(coro)
+  if task_state.owned_failure || task_state.cancellation_requested {
+    coro.cancel()
+  }
 }
 
 ///|

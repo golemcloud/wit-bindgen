@@ -31,7 +31,7 @@ pub impl Eq for Coroutine with equal(c1, c2) {
 
 ///|
 pub impl Hash for Coroutine with hash_combine(self, hasher) {
-  self.coro_id.hash_combine(hasher)
+  Hash::hash_combine(self.coro_id, hasher)
 }
 
 ///|
@@ -79,12 +79,12 @@ pub fn Coroutine::cancel(self : Coroutine) -> Unit {
 
 ///|
 async fn pause() -> Unit {
-  guard scheduler.curr_coro is Some(coro)
+  guard! scheduler.curr_coro is Some(coro)
   if coro.cancelled && not(coro.shielded) {
     raise Cancelled::Cancelled
   }
   async_suspend(fn(ok_cont, err_cont) {
-    guard coro.state is Running
+    guard! coro.state is Running
     coro.state = Suspend(ok_cont~, err_cont~)
     coro.ready = true
     scheduler.run_later.push_back(coro)
@@ -93,7 +93,7 @@ async fn pause() -> Unit {
 
 ///|
 pub async fn suspend() -> Unit {
-  guard scheduler.curr_coro is Some(coro)
+  guard! scheduler.curr_coro is Some(coro)
   if coro.cancelled && not(coro.shielded) {
     raise Cancelled::Cancelled
   }
@@ -102,7 +102,7 @@ pub async fn suspend() -> Unit {
     scheduler.blocking -= 1
   }
   async_suspend(fn(ok_cont, err_cont) {
-    guard coro.state is Running
+    guard! coro.state is Running
     coro.state = Suspend(ok_cont~, err_cont~)
   })
 }
@@ -149,27 +149,24 @@ pub fn Coroutine::unwrap(self : Coroutine) -> Unit raise {
 
 ///|
 pub async fn Coroutine::wait(target : Coroutine) -> Unit {
-  guard scheduler.curr_coro is Some(coro)
-  guard not(physical_equal(coro, target))
+  guard! scheduler.curr_coro is Some(coro)
+  guard! not(physical_equal(coro, target))
   match target.state {
     Done => return
     Fail(err) => raise err
     Running | Suspend(_) => ()
   }
   target.downstream[coro.coro_id] = coro
-  try suspend() catch {
-    err => {
-      target.downstream.remove(coro.coro_id)
-      raise err
-    }
-  } noraise {
-    _ => target.unwrap()
+  errdefer {
+    target.downstream.remove(coro.coro_id)
   }
+  suspend()
+  target.unwrap()
 }
 
 ///|
 pub async fn protect_from_cancel(f : async () -> Unit) -> Unit {
-  guard scheduler.curr_coro is Some(coro)
+  guard! scheduler.curr_coro is Some(coro)
   if coro.shielded {
     // already in a shield, do nothing
     f()

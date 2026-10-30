@@ -1,0 +1,15 @@
+package test:outlined-return;
+
+interface values {
+  record leaf { text: string, tags: list<string> }
+  type alias = leaf;
+  record row { prefix: u32, value: alias }
+  get: async func() -> list<row>;
+  pages: func() -> u32;
+}
+
+world test { export values; }
+world runner {
+  import values;
+  export run: async func();
+}

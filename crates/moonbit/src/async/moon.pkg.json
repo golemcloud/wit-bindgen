@@ -1,5 +1,5 @@
 {
-  "warn-list": "-44",
+  "warn-list": "-44-unused_value-declaration_unimplemented",
   "import": [
     { "path": "moonbitlang/core/deque", "alias": "deque" },
     { "path": "moonbitlang/core/ref", "alias": "ref" },
