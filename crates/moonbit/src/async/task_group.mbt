@@ -161,7 +161,7 @@ pub fn[G, X] TaskGroup::spawn(
   no_wait? : Bool = false,
   allow_failure? : Bool = false,
 ) -> Task[X] {
-  let value = @ref.new(Option::None)
+  let value = Ref(Option::None)
   let coro = self.spawn_coroutine(
     () => value.val = Some(f()),
     no_wait~,

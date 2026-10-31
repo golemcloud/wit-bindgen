@@ -11,7 +11,7 @@ use wit_bindgen_core::{
     AsyncFilterSet, Direction, Files, InterfaceGenerator as CoreInterfaceGenerator, Ns, Source,
     WorldGenerator,
     abi::{self, AbiVariant, Bindgen, Bitcast, Instruction, LiftLower, WasmType},
-    uwrite, uwriteln,
+    dealias, uwrite, uwriteln,
     wit_parser::{
         Alignment, ArchitectureSize, Docs, Enum, Flags, FlagsRepr, Function, Int, InterfaceId,
         LiftLowerAbi, LiveTypes, ManglingAndAbi, Param, Record, Resolve, ResourceIntrinsic,
@@ -1043,7 +1043,7 @@ impl InterfaceGenerator<'_> {
                 // The helper body is generated in a borrow scope so that
                 // `FunctionBindgen`'s borrow of `self` ends before we write the
                 // finished body into `self.ffi` below.
-                let body = {
+                let (body, uses_cleanup_list) = {
                     // Reserve the helper's parameter names (`ptr`, `value`) in the
                     // local namespace so that lowering temps such as the string /
                     // canonical-list pointer (`locals.tmp("ptr")`) become `ptr0`,
@@ -1074,6 +1074,7 @@ impl InterfaceGenerator<'_> {
                             abi::Realloc::Export("cabi_realloc")
                         },
                     );
+                    let uses_cleanup_list = f.needs_cleanup_list || !f.cleanup.is_empty();
                     if borrowed {
                         for cleanup in mem::take(&mut f.cleanup) {
                             uwriteln!(f.src, "cleanup_list.push({})", cleanup.address);
@@ -1095,13 +1096,17 @@ impl InterfaceGenerator<'_> {
                         f.cleanup.is_empty(),
                         "outlined lower helper unexpectedly produced cleanup entries"
                     );
-                    body
+                    (body, uses_cleanup_list)
                 };
 
                 let (name, cleanup) = if borrowed {
                     (
                         name.replace("wit_bindgen_lower_", "wit_bindgen_borrow_lower_"),
-                        ", cleanup_list : Array[Int]",
+                        if uses_cleanup_list {
+                            ", cleanup_list : Array[Int]"
+                        } else {
+                            ", _cleanup_list : Array[Int]"
+                        },
                     )
                 } else {
                     (name.clone(), "")
@@ -1124,10 +1129,15 @@ impl InterfaceGenerator<'_> {
             f.outline_deallocations = true;
             abi::deallocate_lists_from_memory_root(resolve, &mut f, "ptr".into(), id);
             let body = mem::take(&mut f.src);
+            let ptr = if body.trim().is_empty() {
+                "_ptr"
+            } else {
+                "ptr"
+            };
             let name = name.replace("wit_bindgen_lower_", "wit_bindgen_deallocate_");
             uwriteln!(
                 output,
-                "\n#doc(hidden)\n{visibility}fn {name}(ptr : Int) -> Unit {{\n{body}\n}}\n"
+                "\n#doc(hidden)\n{visibility}fn {name}({ptr} : Int) -> Unit {{\n{body}\n}}\n"
             );
         }
         output
@@ -1561,8 +1571,18 @@ impl InterfaceGenerator<'_> {
             None => "Unit".into(),
             Some(ty) => self.world_gen.pkg_resolver.type_name(self.name, ty),
         };
+        // WIT results are ordinary ABI data even when their error type is also
+        // usable with MoonBit's error effect. Do not migrate them to `raise`.
+        let result_warning = if self.derive_opts.derive_error
+            && matches!(sig.result_type, Some(Type::Id(id))
+                if matches!(self.resolve.types[dealias(self.resolve, id)].kind, TypeDefKind::Result(_)))
+        {
+            "#warnings(\"-result_error_return\")\n"
+        } else {
+            ""
+        };
         format!(
-            "pub {}fn {}({params}) -> {}",
+            "{result_warning}pub {}fn {}({params}) -> {}",
             if async_ { "async " } else { "" },
             sig.name,
             result_type
@@ -4260,7 +4280,10 @@ mod tests {
                 interface api {
                     resource io-error;
                     flags app-error { failed }
+                    record scalar { value: u32 }
                     use-types: func(value: borrow<io-error>, options: app-error);
+                    send: func(values: list<scalar>);
+                    result-data: func() -> result<list<scalar>, app-error>;
                 }
 
                 world runner { import api; }
@@ -4279,8 +4302,13 @@ mod tests {
             source.contains("suberror AppError { AppError(Byte) }"),
             "{source}"
         );
+        assert!(source.contains(
+            "#warnings(\"-result_error_return\")\npub fn result_data() -> Result[Array[Scalar], AppError]"
+        ), "{source}");
         let ffi = file(&files, "interface/a/b/api/ffi.mbt");
         assert!(ffi.contains("///|\nfn "), "{ffi}");
+        assert!(ffi.contains("_cleanup_list : Array[Int]"), "{ffi}");
+        assert!(ffi.contains("_ptr : Int"), "{ffi}");
         let package = file(&files, "interface/a/b/api/moon.pkg");
         assert!(package.contains("-unused_value-declaration_unimplemented"));
     }

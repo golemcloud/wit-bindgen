@@ -262,6 +262,9 @@ let component_tasks : Map[WaitableSet, ComponentTaskState] = Map([])
 /// `TaskGroup` structured concurrency, but it is cancelled when the current
 /// component-model task is cancelled and keeps the waitable-set alive until it
 /// terminates.
+/// Only ordinary errors start failure draining; cancellation must not turn a
+/// normal host cancellation request into an owned-task failure.
+#warnings("-fragile_catch_all")
 #internal(wit_bindgen, "generated binding code only")
 #doc(hidden)
 pub fn spawn_component_task_current(f : async () -> Unit) -> Unit {
