@@ -1351,8 +1351,7 @@ impl InterfaceGenerator<'_> {
         uwrite!(
             self.src,
             r#"
-            #warnings("-declaration_unimplemented")
-            declare {func_sig}
+            {func_sig}
             "#
         );
 
@@ -1573,16 +1572,27 @@ impl InterfaceGenerator<'_> {
         };
         // WIT results are ordinary ABI data even when their error type is also
         // usable with MoonBit's error effect. Do not migrate them to `raise`.
-        let result_warning = if self.derive_opts.derive_error
+        let mut warnings = match self.direction {
+            Direction::Import => String::new(),
+            Direction::Export => "-declaration_unimplemented".to_string(),
+        };
+        if self.derive_opts.derive_error
             && matches!(sig.result_type, Some(Type::Id(id))
                 if matches!(self.resolve.types[dealias(self.resolve, id)].kind, TypeDefKind::Result(_)))
         {
-            "#warnings(\"-result_error_return\")\n"
+            warnings.push_str("-result_error_return");
+        }
+        let attributes = if warnings.is_empty() {
+            String::new()
         } else {
-            ""
+            format!("#warnings(\"{warnings}\")\n")
+        };
+        let declaration = match self.direction {
+            Direction::Import => "",
+            Direction::Export => "declare ",
         };
         format!(
-            "{result_warning}pub {}fn {}({params}) -> {}",
+            "{attributes}{declaration}pub {}fn {}({params}) -> {}",
             if async_ { "async " } else { "" },
             sig.name,
             result_type
@@ -4286,7 +4296,7 @@ mod tests {
                     result-data: func() -> result<list<scalar>, app-error>;
                 }
 
-                world runner { import api; }
+                world runner { import api; export api; }
             "#,
             "runner",
             opts,
@@ -4311,6 +4321,11 @@ mod tests {
         assert!(ffi.contains("_ptr : Int"), "{ffi}");
         let package = file(&files, "interface/a/b/api/moon.pkg");
         assert!(package.contains("-unused_value-declaration_unimplemented"));
+        let exports = file(&files, "gen/interface/a/b/api/top.mbt");
+        assert!(
+            exports.contains("#warnings(\"-declaration_unimplemented-result_error_return\")\ndeclare pub fn result_data()"),
+            "{exports}"
+        );
     }
 
     #[test]

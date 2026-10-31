@@ -1276,6 +1276,16 @@ impl<'a> InterfaceGenerator<'a> {
                 _ => break,
             }
         }
+        // Endpoint payloads are ABI data, including Result values whose error
+        // types can also be used with MoonBit's error effect.
+        let result_warning = if self.derive_opts.derive_error
+            && matches!(payload, Some(Type::Id(id))
+                if matches!(self.resolve.types[id].kind, TypeDefKind::Result(_)))
+        {
+            "#warnings(\"-result_error_return\")"
+        } else {
+            ""
+        };
         let element_limit = if payload == Some(Type::U8) {
             65536
         } else if result_type.is_some_and(|ty| is_fixed_primitive(self.resolve, ty)) {
@@ -1404,6 +1414,7 @@ impl<'a> InterfaceGenerator<'a> {
                 format!(
                     r#"
             ///|
+            {result_warning}
             fn wasm{symbol_name}Lift(ptr : Int) -> {result} {{
                 {lift}
                 {lift_result}
@@ -1675,6 +1686,7 @@ fn Wasm{symbol_name}FutureSource::close_sync(
 }}
 
 ///|
+{result_warning}
 async fn Wasm{symbol_name}FutureSource::read(
     self : Wasm{symbol_name}FutureSource,
 ) -> {result} {{
