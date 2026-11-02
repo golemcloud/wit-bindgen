@@ -46,7 +46,9 @@ impl LanguageMethods for Go {
             return true;
         }
         if !runner.go_async_supported() {
-            return name == "async-trait-function.wit" || name == "issue-1598.wit";
+            return name == "async-trait-function.wit"
+                || name == "issue-1598.wit"
+                || name == "async-many-arguments.wit";
         }
 
         false
