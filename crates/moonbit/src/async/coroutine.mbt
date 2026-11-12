@@ -37,6 +37,7 @@ struct Coroutine {
   mut ready : Bool
   mut spawner : ((async () -> Unit) -> Unit)?
   downstream : Set[Coroutine]
+  mut context : TaskContext?
 }
 
 ///|
@@ -123,6 +124,7 @@ fn spawn_owned(
     lane,
     cancelled: false,
     spawner: inherited_spawner,
+    context: None,
   }
   fn run(_) {
     run_async(() => {
@@ -134,6 +136,7 @@ fn spawn_owned(
         _ if coro.state is Running => coro.state = Done
         _ => ()
       }
+      coro.release_inherited_frame()
       for coro in coro.downstream {
         coro.wake()
       }
@@ -142,6 +145,7 @@ fn spawn_owned(
   }
 
   coro.state = Suspend(run)
+  coro.inherit_context()
   enqueue(coro)
   coro
 }
