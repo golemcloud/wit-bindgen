@@ -767,10 +767,12 @@ fn[X] new_local_stream(
 ///|
 fn spawn_stream_producer(task : async () -> Unit) -> Unit {
   let current = current_coroutine()
-  match current.spawner {
-    Some(spawner) => spawner(task)
-    None => ignore(spawn(task))
-  }
+  spawn_producer(() => {
+    match current.spawner {
+      Some(spawner) => spawner(task)
+      None => ignore(spawn(task))
+    }
+  })
 }
 
 ///|

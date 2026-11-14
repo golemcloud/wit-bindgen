@@ -64,11 +64,15 @@ fn reschedule(lane : TaskLane) -> Unit {
     coro.state = Running
     let last_coro = scheduler.curr_coro
     scheduler.curr_coro = Some(coro)
+    // Both continuations, including cancellation cleanup, run in the context
+    // the coroutine owns; the caller's context is installed again afterwards.
+    coro.enter_context()
     if coro.cancelled && !coro.shielded {
       cont(Cancelled)
     } else {
       cont(Continue)
     }
+    coro.leave_context()
     scheduler.curr_coro = last_coro
   }
 }
