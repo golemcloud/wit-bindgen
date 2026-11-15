@@ -88,7 +88,7 @@ pub fn push_task_context_frame(capture_caller~ : Bool) -> TaskContextFrame {
   let frame = {
     owner: coro,
     children: 0,
-    producers: @set.Set::new(),
+    producers: Set([]),
     settled: CondVar(),
   }
   match coro.context {
