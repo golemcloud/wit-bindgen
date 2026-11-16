@@ -292,6 +292,47 @@ pub async fn exercise(background_group : @async-core.TaskGroup[Unit]) -> Bool {
   check("shielded producer finished", late_done.val)
   check("failed scope closed", closed.contains("failed-producer"))
 
+  // A failed nested scope that a producer keeps open delays the enclosing
+  // scope until it closes, instead of failing it.
+  let release_nested = gate()
+  let outer_result : Result[Unit, Error] = Ok(
+    scope("held-outer", async fn() {
+      let inner : Result[Unit, Error] = Ok(
+        scope("held-inner", async fn() {
+          let stream : @async-core.Stream[Int] = @async-core.Stream::produce(async fn(
+            sink,
+          ) {
+            @async-core.protect_from_cancel(async fn() {
+              let values : FixedArray[Int] = [1]
+              ignore(sink.write_all(values[:]))
+              release_nested.acquire()
+              sees("nested shielded producer", ["held-outer", "held-inner"])
+            }) catch {
+              _ => ()
+            }
+          })
+          ignore(stream.read(1))
+          raise ExpectedFailure
+        }),
+      ) catch {
+        error => Err(error)
+      }
+      check("nested failure is caught", inner is Err(ExpectedFailure))
+      check("inner scope still open", !closed.contains("held-inner"))
+      sees("outer after nested failure", ["held-outer"])
+      release_nested.release()
+    }),
+  ) catch {
+    error => Err(error)
+  }
+  check("outer scope succeeds", outer_result is Ok(_))
+  check(
+    "inner closed before outer",
+    closed.search("held-inner") is Some(inner) &&
+    closed.search("held-outer") is Some(outer) &&
+    inner < outer,
+  )
+
   // A producer started by cancellation cleanup after the scope was released
   // starts cancelled.
   let second_cleaned = Ref(false)

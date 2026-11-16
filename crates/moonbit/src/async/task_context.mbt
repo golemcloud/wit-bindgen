@@ -136,11 +136,10 @@ pub fn push_task_context_frame(capture_caller~ : Bool) -> TaskContextFrame {
 
 ///|
 /// The number of tasks that inherited this frame and still run, not counting
-/// stream and future producers, plus the number of released nested frames
-/// that are not closed yet.
+/// stream and future producers.
 #doc(hidden)
 pub fn TaskContextFrame::running_tasks(self : TaskContextFrame) -> Int {
-  self.children.length() + self.pending
+  self.children.length()
 }
 
 ///|
@@ -153,12 +152,12 @@ pub fn TaskContextFrame::running_producers(self : TaskContextFrame) -> Int {
 
 ///|
 /// Wait until every stream and future producer that inherited this frame has
-/// terminated.
+/// terminated and every released nested frame has closed.
 #doc(hidden)
 pub async fn TaskContextFrame::settle_producers(
   self : TaskContextFrame,
 ) -> Unit noraise {
-  while !self.producers.is_empty() {
+  while !self.producers.is_empty() || self.pending > 0 {
     self.settled.wait()
   }
 }
@@ -263,6 +262,9 @@ fn TaskContextFrame::close_if_drained(self : TaskContextFrame) -> Unit {
   close()
   if self.parent is Some(parent) {
     parent.pending -= 1
+    if parent.pending == 0 {
+      parent.settled.broadcast()
+    }
     parent.close_if_drained()
   }
 }
