@@ -293,6 +293,7 @@ const ASYNC_PROMISE: &str = include_str!("./async/promise.mbt");
 const ASYNC_SCHEDULER: &str = include_str!("./async/scheduler.mbt");
 const ASYNC_SEMAPHORE: &str = include_str!("./async/semaphore.mbt");
 const ASYNC_TASK: &str = include_str!("./async/task.mbt");
+const ASYNC_TASK_CONTEXT: &str = include_str!("./async/task_context.mbt");
 const ASYNC_TASK_GROUP: &str = include_str!("./async/task_group.mbt");
 const ASYNC_TRAIT: &str = include_str!("./async/trait.mbt");
 const ASYNC_PKG: &str = include_str!("./async/moon.pkg");
@@ -302,7 +303,7 @@ struct Segment<'a> {
     src: &'a str,
 }
 
-const ASYNC_UTILS: [&Segment; 12] = [
+const ASYNC_UTILS: [&Segment; 13] = [
     &Segment {
         name: "async_primitive",
         src: ASYNC_PRIMITIVE,
@@ -342,6 +343,10 @@ const ASYNC_UTILS: [&Segment; 12] = [
     &Segment {
         name: "async_task",
         src: ASYNC_TASK,
+    },
+    &Segment {
+        name: "async_task_context",
+        src: ASYNC_TASK_CONTEXT,
     },
     &Segment {
         name: "async_task_group",

@@ -274,20 +274,22 @@ let component_tasks : Map[WaitableSet, ComponentTaskState] = Map([])
 pub fn spawn_component_task_current(f : async () -> Unit) -> Unit {
   let waitable_set = current_waitableset()
   guard! component_task_state(waitable_set) is Some(task_state)
-  let coro = spawn_owned(
-    async fn() -> Unit {
-      let coro = current_coroutine()
-      defer task_state.owned_coroutines.remove(coro)
-      f() catch {
-        err => {
-          begin_owned_failure_drain(task_state, coro)
-          raise err
+  let coro = spawn_producer(() => {
+    spawn_owned(
+      async fn() -> Unit {
+        let coro = current_coroutine()
+        defer task_state.owned_coroutines.remove(coro)
+        f() catch {
+          err => {
+            begin_owned_failure_drain(task_state, coro)
+            raise err
+          }
         }
-      }
-    },
-    task_state.lane,
-    Some(spawn_component_task_current),
-  )
+      },
+      task_state.lane,
+      Some(spawn_component_task_current),
+    )
+  })
   task_state.owned_coroutines.add(coro)
   if task_state.owned_failure || task_state.cancellation_requested {
     coro.cancel()
