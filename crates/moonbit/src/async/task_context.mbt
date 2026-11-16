@@ -39,20 +39,28 @@ priv struct TaskContext {
   mut saved : Int?
   mut caller : Int?
   frames : Array[TaskContextFrame]
-  inherited : TaskContextFrame?
+  mut inherited : TaskContextFrame?
   producer : Bool
 }
 
 ///|
 /// A scope a coroutine entered after `push_task_context_frame`. Coroutines
 /// spawned while it is the innermost scope of their spawner, and coroutines
-/// they spawn in turn, inherit the spawner's context and are counted here
-/// until they terminate.
+/// they spawn in turn, inherit the spawner's context and are members of the
+/// frame until they terminate.
+///
+/// A released frame whose members still run stays open: it closes, and its
+/// parent frame counts it as pending, until the last member terminates.
 pub struct TaskContextFrame {
   priv owner : Coroutine
-  priv mut children : Int
+  priv parent : TaskContextFrame?
+  priv children : @set.Set[Coroutine]
   priv producers : @set.Set[Coroutine]
   priv settled : CondVar
+  priv mut cancelling : Bool
+  priv mut pending : Int
+  priv mut close : (() -> Unit)?
+  priv mut before : Int?
 }
 
 ///|
@@ -80,24 +88,19 @@ fn task_context_hooks_or_abort() -> TaskContextHooks {
 /// and the caller's context is installed again at the end of each turn.
 ///
 /// `capture_caller` must be `true` when the coroutine can suspend while the
-/// frame is open. A synchronous scope passes `false` and makes no host call.
+/// frame is open. The frame then also keeps the context installed before the
+/// scope and installs it again in `release`. A synchronous scope passes
+/// `false` and makes no host call.
 #doc(hidden)
 pub fn push_task_context_frame(capture_caller~ : Bool) -> TaskContextFrame {
   let coro = current_coroutine()
   let hooks = task_context_hooks_or_abort()
-  let frame = {
-    owner: coro,
-    children: 0,
-    producers: Set([]),
-    settled: CondVar(),
-  }
+  let parent = coro.current_frame()
   match coro.context {
-    Some(ctx) => {
-      guard !capture_caller || ctx.caller is Some(_) else {
+    Some(ctx) =>
+      if capture_caller && ctx.caller is None {
         abort("an asynchronous scope cannot start inside a synchronous scope")
       }
-      ctx.frames.push(frame)
-    }
     None =>
       coro.context = Some({
         saved: None,
@@ -106,52 +109,129 @@ pub fn push_task_context_frame(capture_caller~ : Bool) -> TaskContextFrame {
         } else {
           None
         },
-        frames: [frame],
+        frames: [],
         inherited: None,
         producer: false,
       })
   }
+  let frame = {
+    owner: coro,
+    parent,
+    children: Set([]),
+    producers: Set([]),
+    settled: CondVar(),
+    cancelling: false,
+    pending: 0,
+    close: None,
+    before: if capture_caller {
+      Some((hooks.exchange)(None))
+    } else {
+      None
+    },
+  }
+  guard coro.context is Some(ctx) else { panic() }
+  ctx.frames.push(frame)
   frame
 }
 
 ///|
-/// Abort unless every coroutine that inherited this frame has terminated.
+/// The number of tasks that inherited this frame and still run, not counting
+/// stream and future producers, plus the number of released nested frames
+/// that are not closed yet.
 #doc(hidden)
-pub fn TaskContextFrame::check_joined(self : TaskContextFrame) -> Unit {
-  if self.children > 0 {
-    abort(
-      "a scope exited while \{self.children} task(s) spawned in it are still running; join them before the scope exits",
-    )
-  }
-  if !self.producers.is_empty() {
-    abort(
-      "a synchronous scope exited while a stream or future producer started in it is still running",
-    )
-  }
+pub fn TaskContextFrame::running_tasks(self : TaskContextFrame) -> Int {
+  self.children.length() + self.pending
+}
+
+///|
+/// The number of stream and future producers that inherited this frame and
+/// still run.
+#doc(hidden)
+pub fn TaskContextFrame::running_producers(self : TaskContextFrame) -> Int {
+  self.producers.length()
 }
 
 ///|
 /// Wait until every stream and future producer that inherited this frame has
-/// terminated, cancelling them first when `cancel_producers` is set, then
-/// abort if a spawned task is still running.
+/// terminated.
 #doc(hidden)
-pub async fn TaskContextFrame::settle(
+pub async fn TaskContextFrame::settle_producers(
   self : TaskContextFrame,
-  cancel_producers? : Bool = false,
 ) -> Unit noraise {
-  if cancel_producers {
-    self.producers.each(Coroutine::cancel)
-  }
   while !self.producers.is_empty() {
     self.settled.wait()
   }
-  self.check_joined()
+}
+
+///|
+/// End the scope without suspending. Every member still running is
+/// cancelled, and tasks that inherit the frame later start cancelled. `close`
+/// runs now when no member runs, and otherwise when the last member
+/// terminates; until then the parent frame counts this frame as pending. An
+/// asynchronous frame installs the context from before the scope again.
+#doc(hidden)
+pub fn TaskContextFrame::release(
+  self : TaskContextFrame,
+  close~ : () -> Unit,
+) -> Unit {
+  guard self.close is None && !self.cancelling else {
+    abort("a scope frame was released twice")
+  }
+  self.cancelling = true
+  self.children.each(Coroutine::cancel)
+  self.producers.each(Coroutine::cancel)
+  if self.drained() {
+    close()
+  } else {
+    self.close = Some(close)
+    if self.parent is Some(parent) {
+      parent.pending += 1
+    }
+  }
+  if self.before is Some(before) {
+    self.before = None
+    let hooks = task_context_hooks_or_abort()
+    (hooks.drop)((hooks.exchange)(Some(before)))
+  }
+}
+
+///|
+/// Move every member of a synchronous frame to the parent frame and cancel
+/// it. The members have not run yet, because a synchronous scope cannot
+/// suspend; they get the current context, which must no longer contain the
+/// scope.
+#doc(hidden)
+pub fn TaskContextFrame::detach_members(self : TaskContextFrame) -> Unit {
+  if self.children.is_empty() && self.producers.is_empty() {
+    return
+  }
+  let hooks = task_context_hooks_or_abort()
+  let members = []
+  self.children.each(task => members.push(task))
+  self.producers.each(task => members.push(task))
+  self.children.clear()
+  self.producers.clear()
+  for task in members {
+    guard task.context is Some(ctx) else { continue }
+    if ctx.saved is Some(saved) {
+      (hooks.drop)(saved)
+      ctx.saved = Some((hooks.exchange)(None))
+    }
+    ctx.inherited = self.parent
+    if self.parent is Some(parent) {
+      if ctx.producer {
+        parent.producers.add(task)
+      } else {
+        parent.children.add(task)
+      }
+    }
+    task.cancel()
+  }
 }
 
 ///|
 /// Pop the innermost frame of the current coroutine. The frame must have been
-/// pushed by this coroutine and every coroutine that inherited it must have
-/// terminated.
+/// pushed by this coroutine.
 #doc(hidden)
 pub fn pop_task_context_frame(frame : TaskContextFrame) -> Unit {
   let coro = current_coroutine()
@@ -161,10 +241,29 @@ pub fn pop_task_context_frame(frame : TaskContextFrame) -> Unit {
     physical_equal(top, frame) else {
     abort("scope frames must be popped in order by the task that pushed them")
   }
-  frame.check_joined()
+  if frame.before is Some(before) {
+    frame.before = None
+    (task_context_hooks_or_abort().drop)(before)
+  }
   ignore(ctx.frames.pop())
   if ctx.frames.is_empty() && ctx.inherited is None && ctx.caller is None {
     coro.context = None
+  }
+}
+
+///|
+fn TaskContextFrame::drained(self : TaskContextFrame) -> Bool {
+  self.children.is_empty() && self.producers.is_empty() && self.pending == 0
+}
+
+///|
+fn TaskContextFrame::close_if_drained(self : TaskContextFrame) -> Unit {
+  guard self.close is Some(close) && self.drained() else { return }
+  self.close = None
+  close()
+  if self.parent is Some(parent) {
+    parent.pending -= 1
+    parent.close_if_drained()
   }
 }
 
@@ -182,7 +281,8 @@ fn Coroutine::current_frame(self : Coroutine) -> TaskContextFrame? {
 
 ///|
 /// Called when `coro` is created. A coroutine spawned inside a scope inherits
-/// the context its spawner has at that moment.
+/// the context its spawner has at that moment, and starts cancelled when the
+/// scope has been released.
 fn Coroutine::inherit_context(self : Coroutine) -> Unit {
   let producer = spawning_producer.val
   spawning_producer.val = false
@@ -201,7 +301,10 @@ fn Coroutine::inherit_context(self : Coroutine) -> Unit {
   if producer {
     frame.producers.add(self)
   } else {
-    frame.children += 1
+    frame.children.add(self)
+  }
+  if frame.cancelling {
+    self.cancel()
   }
 }
 
@@ -217,8 +320,9 @@ fn Coroutine::release_inherited_frame(self : Coroutine) -> Unit {
       frame.settled.broadcast()
     }
   } else {
-    frame.children -= 1
+    frame.children.remove(self)
   }
+  frame.close_if_drained()
 }
 
 ///|

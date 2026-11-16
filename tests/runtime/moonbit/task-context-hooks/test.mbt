@@ -21,6 +21,11 @@ let exchanges : Ref[Int] = Ref(0)
 let failures : Array[String] = []
 
 ///|
+/// Scopes whose live invocation was dropped. Like the host, the fake rejects
+/// installing a context that still contains one of them.
+let closed : Array[String] = []
+
+///|
 fn fake_exchange(next : Int?) -> Int {
   exchanges.val += 1
   let handle = next_handle.val
@@ -31,6 +36,9 @@ fn fake_exchange(next : Int?) -> Int {
       abort("installed an unknown or consumed handle")
     }
     handles.remove(next)
+    if context.iter().any(scope => closed.contains(scope)) {
+      failures.push("installed a closed scope")
+    }
     ambient.val = context
   }
   handle
@@ -60,23 +68,47 @@ fn sees(label : String, expected : Array[String]) -> Unit {
 suberror ExpectedFailure derive(Debug)
 
 ///|
+suberror TasksStillRunning derive(Debug)
+
+///|
+#deprecated
+pub extend TasksStillRunning with Debug::{to_repr}
+
+///|
 #deprecated
 pub extend ExpectedFailure with Debug::{to_repr}
 
 ///|
 /// Mirrors a custom durable operation: the scope is installed on the task when
-/// the body starts and removed when it ends, normally or not.
+/// the body starts. It is removed when it ends and the last task that inherited
+/// it has terminated.
 async fn scope(name : String, body : async () -> Unit) -> Unit {
   let frame = @async-core.push_task_context_frame(capture_caller=true)
   let entered = ambient.val.copy()
   entered.push(name)
   ambient.val = entered
   defer {
-    ambient.val = ambient.val.filter(scope => scope != name)
+    frame.release(close=() => {
+      ambient.val = ambient.val.filter(scope => scope != name)
+      closed.push(name)
+    })
     @async-core.pop_task_context_frame(frame)
   }
   body()
-  frame.settle()
+  guard frame.running_tasks() == 0 else { raise TasksStillRunning }
+  frame.settle_producers()
+  guard frame.running_tasks() == 0 else { raise TasksStillRunning }
+}
+
+///|
+/// Lets other coroutines run until `done` holds, for a bounded number of rounds.
+async fn run_until(done : () -> Bool) -> Unit {
+  for _ in 0..<20 {
+    if done() {
+      return
+    }
+    idle_round()
+  }
 }
 
 ///|
@@ -98,6 +130,7 @@ async fn idle_round() -> Unit {
 pub async fn exercise(background_group : @async-core.TaskGroup[Unit]) -> Bool {
   ignore(background_group)
   failures.clear()
+  closed.clear()
   exchanges.val = 0
   @async-core.install_task_context_hooks(exchange=fake_exchange, drop=fake_drop)
 
@@ -224,6 +257,124 @@ pub async fn exercise(background_group : @async-core.TaskGroup[Unit]) -> Bool {
   check("producer scope", produced_in.val == Some(["streaming"]))
   check("scope waited for producer", producer_finished.val)
   sees("after streaming", [])
+
+  // A failed body returns its error at once, while a producer that cannot be
+  // cancelled still runs. The scope stays open until the producer terminates.
+  let late_done = Ref(false)
+  let release_late = gate()
+  let failed_with_producer : Result[Unit, Error] = Ok(
+    scope("failed-producer", async fn() {
+      let stream : @async-core.Stream[Int] = @async-core.Stream::produce(async fn(
+        sink,
+      ) {
+        @async-core.protect_from_cancel(async fn() {
+          let values : FixedArray[Int] = [1]
+          ignore(sink.write_all(values[:]))
+          release_late.acquire()
+          sees("shielded producer after failure", ["failed-producer"])
+          late_done.val = true
+        }) catch {
+          _ => ()
+        }
+      })
+      ignore(stream.read(1))
+      raise ExpectedFailure
+    }),
+  ) catch {
+    error => Err(error)
+  }
+  check("failure returns at once", failed_with_producer is Err(ExpectedFailure))
+  check("producer still runs", !late_done.val)
+  check("failed scope stays open", !closed.contains("failed-producer"))
+  sees("owner after failed scope", [])
+  release_late.release()
+  run_until(() => closed.contains("failed-producer"))
+  check("shielded producer finished", late_done.val)
+  check("failed scope closed", closed.contains("failed-producer"))
+
+  // A producer started by cancellation cleanup after the scope was released
+  // starts cancelled.
+  let second_cleaned = Ref(false)
+  let never_late = gate()
+  let failed_with_cleanup : Result[Unit, Error] = Ok(
+    scope("late-spawn", async fn() {
+      let first : @async-core.Stream[Int] = @async-core.Stream::produce(async fn(
+        sink,
+      ) {
+        defer {
+          @async-core.protect_from_cancel(async fn() {
+            let second : @async-core.Stream[Int] = @async-core.Stream::produce(async fn(
+              sink,
+            ) {
+              defer {
+                second_cleaned.val = true
+              }
+              let values : FixedArray[Int] = [1]
+              ignore(sink.write_all(values[:]))
+              never_late.acquire()
+            })
+            ignore(second.read(1))
+          }) catch {
+            _ => ()
+          }
+        }
+        let values : FixedArray[Int] = [1]
+        ignore(sink.write_all(values[:]))
+        never_late.acquire()
+      })
+      ignore(first.read(1))
+      raise ExpectedFailure
+    }),
+  ) catch {
+    error => Err(error)
+  }
+  check("cleanup failure returns", failed_with_cleanup is Err(ExpectedFailure))
+  run_until(() => closed.contains("late-spawn"))
+  check("late producer was cancelled", second_cleaned.val)
+  check("late-spawn scope closed", closed.contains("late-spawn"))
+
+  // A task that is still running when the body returns fails the scope with
+  // an error; it is cancelled, and the scope closes after it terminates.
+  let escaped_cleaned = Ref(false)
+  let never_escaped = gate()
+  let escaped : Result[Unit, Error] = Ok(
+    @async-core.with_task_group(async fn(group) {
+      scope("escaped", async fn() {
+        group.spawn_bg(async fn() {
+          defer {
+            escaped_cleaned.val = true
+          }
+          never_escaped.acquire()
+        })
+      })
+    }),
+  ) catch {
+    error => Err(error)
+  }
+  check("escaped task fails the scope", escaped is Err(TasksStillRunning))
+  check("escaped task was cancelled", escaped_cleaned.val)
+  check("escaped scope closed", closed.contains("escaped"))
+  sees("after escaped", [])
+
+  // Members of a synchronous scope that has ended move to the parent and get
+  // the context that is installed then.
+  let detached_saw : Ref[Array[String]?] = Ref(None)
+  let never_detached = gate()
+  @async-core.with_task_group(async fn(group) {
+    let frame = @async-core.push_task_context_frame(capture_caller=false)
+    ambient.val = ["sync"]
+    group.spawn_bg(async fn() {
+      detached_saw.val = Some(ambient.val.copy())
+      never_detached.acquire()
+    })
+    check("sync scope counts its task", frame.running_tasks() == 1)
+    ambient.val = []
+    closed.push("sync")
+    frame.detach_members()
+    check("sync scope has no members", frame.running_tasks() == 0)
+    @async-core.pop_task_context_frame(frame)
+  })
+  check("detached task left the scope", detached_saw.val == Some([]))
 
   // The first suspension after the last scope closed installs the caller's
   // context again and releases ownership.
