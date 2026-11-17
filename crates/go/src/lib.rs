@@ -19,7 +19,7 @@ use wit_bindgen_core::wit_parser::{
     TypeDefKind, TypeId, TypeOwner, Variant, WorldId, WorldKey,
 };
 use wit_bindgen_core::{
-    AsyncFilterSet, Direction, Files, InterfaceGenerator as _, Ns, WorldGenerator, uwriteln,
+    AsyncFilterSet, Direction, Files, InterfaceGenerator as _, Ns, Types, WorldGenerator, uwriteln,
 };
 
 const MAX_FLAT_PARAMS: usize = 16;
@@ -151,6 +151,10 @@ pub struct Opts {
     /// references more than one version of the WIT package.
     #[cfg_attr(feature = "clap", clap(long))]
     pub include_versions: bool,
+
+    /// Share named aggregate memory conversions within each generated package.
+    #[cfg_attr(feature = "clap", clap(long))]
+    pub outline_memory: bool,
 }
 
 impl Opts {
@@ -214,6 +218,33 @@ impl From<InterfaceGenerator<'_>> for InterfaceData {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum MemoryHelperKind {
+    Lift,
+    Lower,
+    RestoreLower,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct MemoryHelper {
+    ty: TypeId,
+    kind: MemoryHelperKind,
+    interface: Option<WorldKey>,
+    in_import: bool,
+    in_exports: bool,
+}
+
+impl MemoryHelper {
+    fn name(&self) -> String {
+        let kind = match self.kind {
+            MemoryHelperKind::Lift => "lift",
+            MemoryHelperKind::Lower => "lower",
+            MemoryHelperKind::RestoreLower => "restore_lower",
+        };
+        format!("wasm_{kind}_{}_t{}", self.in_import as u8, self.ty.index())
+    }
+}
+
 #[derive(Default)]
 struct Go {
     opts: Opts,
@@ -239,9 +270,91 @@ struct Go {
     futures_and_streams: HashMap<(TypeId, bool), Option<WorldKey>>,
     // Tracks which `future`/`stream` declarations have already been generated.
     generated_futures_and_streams: HashSet<FutureStreamDedup>,
+    type_info: Types,
+    memory_helpers: Vec<MemoryHelper>,
+    registered_memory_helpers: HashSet<MemoryHelper>,
 }
 
 impl Go {
+    // Emit while the current interface's resource directions and type names are active.
+    fn generate_memory_helpers(&mut self, resolve: &Resolve) {
+        let mut index = 0;
+        while index < self.memory_helpers.len() {
+            let helper = self.memory_helpers[index].clone();
+            index += 1;
+            let name = helper.name();
+            let mut generator = FunctionGenerator::new(
+                self,
+                helper.in_exports.then_some("INVALID"),
+                None,
+                helper.interface.as_ref(),
+                "INVALID",
+                vec!["src".into(), "value".into(), "dst".into(), PINNER.into()],
+                false,
+                helper.in_import,
+            );
+            let ty = generator.type_name(resolve, Type::Id(helper.ty));
+            generator.need_unsafe = true;
+            let code = match helper.kind {
+                MemoryHelperKind::Lift => {
+                    let result = abi::lift_from_memory_root(
+                        resolve,
+                        &mut generator,
+                        "src".into(),
+                        &Type::Id(helper.ty),
+                        helper.ty,
+                    );
+                    let body = mem::take(&mut generator.src);
+                    format!(
+                        "\n//go:noinline\nfunc {name}(src unsafe.Pointer) {ty} {{\n{body}\nreturn {result}\n}}\n"
+                    )
+                }
+                MemoryHelperKind::Lower | MemoryHelperKind::RestoreLower => {
+                    generator.need_pinner = true;
+                    generator.collect_lifters = helper.kind == MemoryHelperKind::RestoreLower;
+                    abi::lower_to_memory_root(
+                        resolve,
+                        &mut generator,
+                        "dst".into(),
+                        "value".into(),
+                        &Type::Id(helper.ty),
+                        helper.ty,
+                    );
+                    let body = mem::take(&mut generator.src);
+                    let (result, prefix, suffix) = if generator.collect_lifters {
+                        (
+                            " func()",
+                            format!("lifters := make([]func(), 0, {})\n", generator.lifter_count),
+                            "\nreturn func() { for _, lifter := range lifters { lifter() } }",
+                        )
+                    } else {
+                        ("", String::new(), "")
+                    };
+                    format!(
+                        "\n//go:noinline\nfunc {name}(pinner *runtime.Pinner, value {ty}, dst unsafe.Pointer){result} {{\n{prefix}{body}{suffix}\n}}\n"
+                    )
+                }
+            };
+            assert!(generator.return_area_size.is_empty());
+            let data = InterfaceData::from_generator_and_code(generator, code);
+            if helper.in_exports {
+                self.src.push_str(&data.code);
+                self.imports.extend(data.imports);
+                self.need_unsafe |= data.need_unsafe;
+                self.need_math |= data.need_math;
+            } else {
+                let package = self.go_package_name(resolve, helper.interface.as_ref());
+                let interfaces = if helper.in_import {
+                    &mut self.interfaces
+                } else {
+                    &mut self.export_interfaces
+                };
+                interfaces.entry(package).or_default().extend(data);
+            }
+        }
+        self.memory_helpers.clear();
+    }
+
     /// Adds the bindings module prefix to a package name.
     fn mod_pkg(&self, for_export: bool, name: &str) -> String {
         let prefix = for_export
@@ -742,6 +855,9 @@ impl WorldGenerator for Go {
     fn preprocess(&mut self, resolve: &Resolve, world: WorldId) -> Result<()> {
         _ = world;
         self.sizes.fill(resolve);
+        if self.opts.outline_memory {
+            self.type_info.analyze(resolve);
+        }
         self.imports.insert(remote_pkg("runtime"));
         Ok(())
     }
@@ -778,6 +894,7 @@ impl WorldGenerator for Go {
             .or_default()
             .extend(data);
 
+        self.generate_memory_helpers(resolve);
         Ok(())
     }
 
@@ -796,6 +913,7 @@ impl WorldGenerator for Go {
             .entry(self.go_package_name(resolve, None))
             .or_default()
             .extend(data);
+        self.generate_memory_helpers(resolve);
     }
 
     fn export_interface(
@@ -840,6 +958,7 @@ impl WorldGenerator for Go {
             self.src.push_str(&code);
         }
 
+        self.generate_memory_helpers(resolve);
         Ok(())
     }
 
@@ -854,6 +973,7 @@ impl WorldGenerator for Go {
             let code = self.export(resolve, func, None);
             self.src.push_str(&code);
         }
+        self.generate_memory_helpers(resolve);
         Ok(())
     }
 
@@ -873,10 +993,12 @@ impl WorldGenerator for Go {
         }
         let data = generator.into();
         self.interfaces.entry(package).or_default().extend(data);
+        self.generate_memory_helpers(resolve);
     }
 
     fn finish(&mut self, resolve: &Resolve, id: WorldId, files: &mut Files) -> Result<()> {
         _ = (resolve, id);
+        self.generate_memory_helpers(resolve);
 
         let version = env!("CARGO_PKG_VERSION");
         let packages = resolve
@@ -1700,6 +1822,33 @@ impl<'a> FunctionGenerator<'a> {
             &mut self.imports,
         )
     }
+
+    fn memory_helper(&self, ty: TypeId, kind: MemoryHelperKind) -> MemoryHelper {
+        MemoryHelper {
+            ty,
+            kind,
+            interface: self.interface_for_types.cloned(),
+            in_import: self.in_import,
+            in_exports: self.name.is_some(),
+        }
+    }
+
+    fn outlines(&self, resolve: &Resolve, ty: TypeId) -> bool {
+        self.generator.opts.outline_memory
+            && resolve.types[ty].name.is_some()
+            && matches!(
+                resolve.types[ty].kind,
+                TypeDefKind::Record(_) | TypeDefKind::Variant(_)
+            )
+    }
+
+    fn lower_helper_kind(&self, ty: TypeId) -> MemoryHelperKind {
+        if self.collect_lifters && self.generator.type_info.get(ty).has_own_handle {
+            MemoryHelperKind::RestoreLower
+        } else {
+            MemoryHelperKind::Lower
+        }
+    }
 }
 
 impl Bindgen for FunctionGenerator<'_> {
@@ -1754,6 +1903,16 @@ impl Bindgen for FunctionGenerator<'_> {
         )
     }
 
+    fn lift_helper_name(&self, resolve: &Resolve, ty: TypeId) -> Option<String> {
+        self.outlines(resolve, ty)
+            .then(|| self.memory_helper(ty, MemoryHelperKind::Lift).name())
+    }
+
+    fn lower_helper_name(&self, resolve: &Resolve, ty: TypeId) -> Option<String> {
+        self.outlines(resolve, ty)
+            .then(|| self.memory_helper(ty, self.lower_helper_kind(ty)).name())
+    }
+
     fn emit(
         &mut self,
         resolve: &Resolve,
@@ -1784,6 +1943,56 @@ impl Bindgen for FunctionGenerator<'_> {
 
         match instruction {
             Instruction::GetArg { nth } => results.push(self.param_names[*nth].clone()),
+            Instruction::LiftNamedFromMemory { ty, offset } => {
+                let helper = self.memory_helper(*ty, MemoryHelperKind::Lift);
+                let name = helper.name();
+                if self
+                    .generator
+                    .registered_memory_helpers
+                    .insert(helper.clone())
+                {
+                    self.generator.memory_helpers.push(helper);
+                }
+                self.need_unsafe = true;
+                let offset = offset.format(POINTER_SIZE_EXPRESSION);
+                let result = self.locals.tmp("result");
+                uwriteln!(
+                    self.src,
+                    "{result} := {name}(unsafe.Add(unsafe.Pointer({}), {offset}))",
+                    operands[0]
+                );
+                results.push(result);
+            }
+            Instruction::LowerNamedToMemory { ty, offset } => {
+                let kind = self.lower_helper_kind(*ty);
+                let helper = self.memory_helper(*ty, kind);
+                let name = helper.name();
+                if self
+                    .generator
+                    .registered_memory_helpers
+                    .insert(helper.clone())
+                {
+                    self.generator.memory_helpers.push(helper);
+                }
+                self.need_unsafe = true;
+                let pinner = if self.generator.type_info.get(*ty).has_list {
+                    self.need_pinner = true;
+                    PINNER
+                } else {
+                    "nil"
+                };
+                let offset = offset.format(POINTER_SIZE_EXPRESSION);
+                let call = format!(
+                    "{name}({pinner}, {}, unsafe.Add(unsafe.Pointer({}), {offset}))",
+                    operands[0], operands[1]
+                );
+                if kind == MemoryHelperKind::RestoreLower {
+                    self.lifter_count += 1;
+                    uwriteln!(self.src, "lifters = append(lifters, {call})");
+                } else {
+                    uwriteln!(self.src, "{call}");
+                }
+            }
             Instruction::StringLower { .. } => {
                 self.need_pinner = true;
                 self.need_unsafe = true;

@@ -39,6 +39,7 @@ impl LanguageMethods for Go {
         config: &crate::config::WitConfig,
         _args: &[String],
     ) -> bool {
+        let name = name.strip_suffix("-outlined").unwrap_or(name);
         if config.error_context {
             return true;
         }
@@ -75,6 +76,10 @@ impl LanguageMethods for Go {
 
     fn default_bindgen_args_for_codegen(&self) -> &[&str] {
         &["--generate-stubs"]
+    }
+
+    fn codegen_test_variants(&self) -> &[(&str, &[&str])] {
+        &[("outlined", &["--outline-memory"])]
     }
 
     fn prepare(&self, runner: &mut Runner) -> Result<()> {

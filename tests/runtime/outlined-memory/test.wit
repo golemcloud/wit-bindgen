@@ -1,0 +1,72 @@
+//@ async = true
+package test:outlined-memory;
+
+interface api {
+  resource token {
+    constructor(value: u32);
+    get: func() -> u32;
+  }
+
+  record packet {
+    marker: u8,
+    label: string,
+    tokens: list<token>,
+    tail: u64,
+  }
+
+  variant entry {
+    empty,
+    value(packet),
+    code(u32),
+  }
+
+  record batch {
+    prefix: u16,
+    optional: option<entry>,
+    outcome: result<entry, u32>,
+    channel: option<stream<u8>>,
+    deferred: option<future<u32>>,
+    suffix: u32,
+  }
+
+  record borrowed-token {
+    marker: u32,
+    value: borrow<token>,
+  }
+
+  record leaf {
+    marker: u8,
+    optional: option<string>,
+    outcome: result<list<u32>, string>,
+    tail: u64,
+  }
+
+  record level-one { a: leaf, b: leaf, c: leaf, d: leaf }
+  record level-two { a: level-one, b: level-one, c: level-one, d: level-one }
+  record level-three { a: level-two, b: level-two, c: level-two, d: level-two }
+  record level-four { a: level-three, b: level-three, c: level-three, d: level-three }
+  record level-five { a: level-four, b: level-four, c: level-four, d: level-four }
+
+  large-echo: func(value: level-five) -> level-five;
+  echo: func(value: batch) -> batch;
+  inspect: func(values: list<borrowed-token>) -> u32;
+  drop-count: func() -> u32;
+  short-reads: async func(values: stream<batch>) -> stream<batch>;
+  dropped-reader: async func(first: future<batch>, second: future<batch>) -> tuple<future<batch>, future<batch>>;
+}
+
+interface mirror {
+  use api.{batch};
+  echo: func(values: list<batch>) -> list<batch>;
+}
+
+world test {
+  export api;
+  export mirror;
+}
+
+world runner {
+  import api;
+  import mirror;
+  export run: async func();
+}

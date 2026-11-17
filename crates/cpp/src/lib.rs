@@ -2509,6 +2509,10 @@ impl<'a, 'b> Bindgen for FunctionBindgen<'a, 'b> {
         };
 
         match inst {
+            abi::Instruction::LiftNamedFromMemory { .. }
+            | abi::Instruction::LowerNamedToMemory { .. } => {
+                unreachable!("memory helpers are not enabled for this backend")
+            }
             abi::Instruction::GetArg { nth } => {
                 if *nth == 0 && self.params[0].as_str() == "self" {
                     if self.r#gen.in_guest_import {

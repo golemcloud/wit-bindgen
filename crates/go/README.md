@@ -22,6 +22,14 @@ $ wit-bindgen go [OPTIONS] <WIT>
 
 See the output of `wit-bindgen help go` for available options.
 
+Use `--outline-memory` to generate private memory conversion helpers for named
+records and variants in each using package. Nested conversions call these helpers
+instead of expanding the aggregate at every use. The helpers are not inlined,
+which avoids expansion-driven failures at the Go WebAssembly backend's
+per-function block limit. Lower helpers share the caller's pinner and preserve
+handle restoration for stream and future writes. This option does not change
+the exported binding signatures.
+
 This command will generate a variable number of files, depending on the WIT
 world provided:
 

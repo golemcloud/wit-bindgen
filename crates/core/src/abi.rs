@@ -122,6 +122,13 @@ def_instruction! {
         /// Like `I32Load` or `I64Load`, but for loading array length values.
         LengthLoad { offset: ArchitectureSize } : [1] => [1],
 
+        /// Reads a named aggregate through a shared helper at the given offset.
+        LiftNamedFromMemory { ty: TypeId, offset: ArchitectureSize } : [1] => [1],
+
+        /// Writes a named aggregate through a shared helper. The operands are
+        /// the value followed by the base pointer.
+        LowerNamedToMemory { ty: TypeId, offset: ArchitectureSize } : [2] => [0],
+
         /// Pops a pointer from the stack and then an `i32` value.
         /// Stores the value in little-endian at the pointer specified plus the
         /// constant `offset`.
@@ -791,6 +798,16 @@ pub trait Bindgen {
     /// "canonical" form for lists. This dictates whether the `ListCanonLower`
     /// and `ListCanonLift` instructions are used or not.
     fn is_list_canonical(&self, resolve: &Resolve, element: &Type) -> bool;
+
+    /// Returns the shared memory-lift helper for a named aggregate, if any.
+    fn lift_helper_name(&self, _resolve: &Resolve, _id: TypeId) -> Option<String> {
+        None
+    }
+
+    /// Returns the shared memory-lower helper for a named aggregate, if any.
+    fn lower_helper_name(&self, _resolve: &Resolve, _id: TypeId) -> Option<String> {
+        None
+    }
 }
 
 /// Generates an abstract sequence of instructions which represents this
@@ -858,6 +875,39 @@ pub fn lift_from_memory<B: Bindgen>(
     let mut generator = Generator::new(resolve, bindgen);
     generator.read_from_memory(ty, address, Default::default());
     generator.stack.pop().unwrap()
+}
+
+/// Generates a lift helper body, expanding the root once and outlining children.
+pub fn lift_from_memory_root<B: Bindgen>(
+    resolve: &Resolve,
+    bindgen: &mut B,
+    address: B::Operand,
+    ty: &Type,
+    skip_outline_root: TypeId,
+) -> B::Operand {
+    assert!(matches!(ty, Type::Id(id) if *id == skip_outline_root));
+    let mut generator = Generator::new(resolve, bindgen);
+    generator.lift_outline_root = Some(skip_outline_root);
+    generator.read_from_memory(ty, address, Default::default());
+    generator.stack.pop().unwrap()
+}
+
+/// Generates a lower helper body, expanding the root once and outlining children.
+pub fn lower_to_memory_root<B: Bindgen>(
+    resolve: &Resolve,
+    bindgen: &mut B,
+    address: B::Operand,
+    value: B::Operand,
+    ty: &Type,
+    skip_outline_root: TypeId,
+) {
+    assert!(matches!(ty, Type::Id(id) if *id == skip_outline_root));
+    let mut generator = Generator::new(resolve, bindgen);
+    generator.realloc = Some(Realloc::Export("cabi_realloc"));
+    generator.lower_outline_root = Some(skip_outline_root);
+    generator.stack.push(value);
+    generator.write_to_memory(ty, address, Default::default());
+    debug_assert!(generator.stack.is_empty());
 }
 
 /// Used in a similar manner as the `Interface::call` function except is
@@ -1001,6 +1051,8 @@ struct Generator<'a, B: Bindgen> {
     stack: Vec<B::Operand>,
     return_pointer: Option<B::Operand>,
     realloc: Option<Realloc>,
+    lift_outline_root: Option<TypeId>,
+    lower_outline_root: Option<TypeId>,
 }
 
 const MAX_FLAT_PARAMS: usize = 16;
@@ -1016,6 +1068,8 @@ impl<'a, B: Bindgen> Generator<'a, B> {
             stack: Vec::new(),
             return_pointer: None,
             realloc: None,
+            lift_outline_root: None,
+            lower_outline_root: None,
         }
     }
 
@@ -1953,6 +2007,15 @@ impl<'a, B: Bindgen> Generator<'a, B> {
     fn write_to_memory(&mut self, ty: &Type, addr: B::Operand, offset: ArchitectureSize) {
         use Instruction::*;
 
+        if let Type::Id(id) = *ty {
+            let is_root = self.lower_outline_root.take() == Some(id);
+            if !is_root && self.bindgen.lower_helper_name(self.resolve, id).is_some() {
+                self.stack.push(addr);
+                self.emit(&LowerNamedToMemory { ty: id, offset });
+                return;
+            }
+        }
+
         match *ty {
             // Builtin types need different flavors of storage instructions
             // depending on the size of the value written.
@@ -2163,6 +2226,15 @@ impl<'a, B: Bindgen> Generator<'a, B> {
 
     fn read_from_memory(&mut self, ty: &Type, addr: B::Operand, offset: ArchitectureSize) {
         use Instruction::*;
+
+        if let Type::Id(id) = *ty {
+            let is_root = self.lift_outline_root.take() == Some(id);
+            if !is_root && self.bindgen.lift_helper_name(self.resolve, id).is_some() {
+                self.stack.push(addr);
+                self.emit(&LiftNamedFromMemory { ty: id, offset });
+                return;
+            }
+        }
 
         match *ty {
             Type::Bool => self.emit_and_lift(ty, addr, &I32Load8U { offset }),

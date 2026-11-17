@@ -1646,6 +1646,9 @@ impl Bindgen for FunctionBindgen<'_, '_> {
         results: &mut Vec<String>,
     ) {
         match inst {
+            Instruction::LiftNamedFromMemory { .. } | Instruction::LowerNamedToMemory { .. } => {
+                unreachable!("memory helpers are not enabled for this backend")
+            }
             Instruction::GetArg { nth } => results.push(self.params[*nth].clone()),
             Instruction::I32Const { val } => results.push(format!("({val})")),
             Instruction::ConstZero { tys } => results.extend(tys.iter().map(|ty| {
