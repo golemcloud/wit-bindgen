@@ -26,6 +26,7 @@ pub(crate) struct MoonbitSignature {
 #[derive(Default)]
 pub(crate) struct PkgResolver {
     pub resolve: Resolve,
+    pub reserved_alias: Option<&'static str>,
     // Packages imported by each package
     pub package_import: HashMap<String, Imports>,
     pub import_interface_names: HashMap<InterfaceId, String>,
@@ -36,6 +37,9 @@ impl PkgResolver {
     pub(crate) fn qualify_package(&mut self, this: &str, name: &str) -> String {
         if name != this {
             let imports = self.package_import.entry(this.to_string()).or_default();
+            if let Some(alias) = self.reserved_alias {
+                let _ = imports.ns.insert(alias);
+            }
             let current_package_alias = this.rsplit('.').next().unwrap();
             let _ = imports.ns.insert(current_package_alias);
             if let Some(alias) = imports.packages.get(name) {

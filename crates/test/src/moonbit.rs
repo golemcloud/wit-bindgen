@@ -64,10 +64,21 @@ impl LanguageMethods for MoonBit {
         }
 
         // Compile the MoonBit bindings to a wasm file
+        let target = if compile
+            .component
+            .bindgen
+            .args
+            .iter()
+            .any(|arg| arg == "--wasm-gc")
+        {
+            "wasm-gc"
+        } else {
+            "wasm"
+        };
         let mut cmd = Command::new("moon");
         cmd.arg("build")
             .arg("--target")
-            .arg("wasm")
+            .arg(target)
             .arg("--release")
             .arg("--no-strip") // for debugging
             .current_dir(&compile.bindings_dir);
@@ -77,16 +88,16 @@ impl LanguageMethods for MoonBit {
         let artifact_candidates = [
             compile
                 .bindings_dir
-                .join("_build/wasm/release/build/gen/gen.wasm"),
+                .join(format!("_build/{target}/release/build/gen/gen.wasm")),
             compile
                 .bindings_dir
-                .join("target/wasm/release/build/gen/gen.wasm"),
+                .join(format!("target/{target}/release/build/gen/gen.wasm")),
             compile
                 .bindings_dir
-                .join("_build/wasm/debug/build/gen/gen.wasm"),
+                .join(format!("_build/{target}/debug/build/gen/gen.wasm")),
             compile
                 .bindings_dir
-                .join("target/wasm/debug/build/gen/gen.wasm"),
+                .join(format!("target/{target}/debug/build/gen/gen.wasm")),
         ];
         let artifact = artifact_candidates
             .iter()
@@ -128,15 +139,23 @@ impl LanguageMethods for MoonBit {
     }
 
     fn verify(&self, runner: &Runner, verify: &crate::Verify) -> anyhow::Result<()> {
+        let target = if verify.args.iter().any(|arg| arg == "--wasm-gc") {
+            "wasm-gc"
+        } else {
+            "wasm"
+        };
         let mut cmd = Command::new("moon");
         cmd.arg("check")
+            .args(["--target", target])
             .arg("--warn-list")
             .arg("-28") // avoid warning noise in generated bindings
             .current_dir(&verify.bindings_dir);
 
         runner.run_command(&mut cmd)?;
         let mut cmd = Command::new("moon");
-        cmd.arg("build").current_dir(&verify.bindings_dir);
+        cmd.arg("build")
+            .args(["--target", target])
+            .current_dir(&verify.bindings_dir);
 
         runner.run_command(&mut cmd)?;
         Ok(())

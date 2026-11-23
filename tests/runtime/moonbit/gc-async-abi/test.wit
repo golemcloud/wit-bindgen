@@ -1,0 +1,13 @@
+//@ async = true
+package test:gc-async-abi;
+
+interface consumer {
+  consume: async func(value: stream<u8>, stop-early: bool) -> u32;
+  pages: func() -> u32;
+}
+
+world test { export consumer; }
+world runner {
+  import consumer;
+  export run: async func();
+}
