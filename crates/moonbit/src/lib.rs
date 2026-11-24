@@ -27,6 +27,7 @@ use crate::pkg::{
 
 mod async_support;
 mod ffi;
+mod gc;
 mod pkg;
 
 // Assumptions:
@@ -48,6 +49,10 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub struct Opts {
     #[cfg_attr(feature = "clap", clap(flatten))]
     pub derive: DeriveOpts,
+
+    /// Generate experimental bindings for MoonBit's Wasm GC backend.
+    #[cfg_attr(feature = "clap", arg(long, default_value_t = false))]
+    pub wasm_gc: bool,
 
     /// Whether or not to generate stub files ; useful for update after WIT change
     #[cfg_attr(feature = "clap", arg(long, default_value_t = false))]
@@ -203,6 +208,14 @@ pub struct MoonBit {
 }
 
 impl MoonBit {
+    fn builtin(&self, source: &'static str) -> String {
+        if self.opts.wasm_gc {
+            gc::builtin(source).unwrap_or_else(|| source.to_string())
+        } else {
+            source.to_string()
+        }
+    }
+
     fn export_lower_package(&self) -> String {
         format!("{}.wit_bindgen_export_lower", self.opts.r#gen_dir)
     }
@@ -292,13 +305,19 @@ impl MoonBit {
         wasm_only: bool,
     ) {
         // Dependencies
-        if let Some(imports) = imports {
+        if imports.is_some() || self.opts.wasm_gc {
             moon_pkg.push_str("import {\n");
             let mut deps = imports
-                .packages
-                .iter()
+                .into_iter()
+                .flat_map(|imports| imports.packages.iter())
                 .map(|(k, v)| format!("\"{}/{}\" @{},", self.project_name, k.replace(".", "/"), v))
                 .collect::<Vec<_>>();
+            if self.opts.wasm_gc {
+                deps.push(format!(
+                    "\"{}/{}/cabi\" @witCabi,",
+                    self.project_name, self.opts.gen_dir
+                ));
+            }
             deps.sort();
             uwriteln!(moon_pkg, "{}", deps.join("\n"));
             moon_pkg.push_str("}\n\n");
@@ -307,8 +326,16 @@ impl MoonBit {
         moon_pkg.push_str("warnings = \"-44-unused_value-declaration_unimplemented\"\n");
         let imports_async_core =
             imports.is_some_and(|imports| imports.packages.contains_key(ASYNC_CORE_DIR));
-        if wasm_only || imports_async_core || (link && self.async_support.is_required()) {
-            moon_pkg.push_str("supported_targets = \"wasm\"\n");
+        if self.opts.wasm_gc
+            || wasm_only
+            || imports_async_core
+            || (link && self.async_support.is_required())
+        {
+            uwriteln!(
+                moon_pkg,
+                "supported_targets = {:?}",
+                if self.opts.wasm_gc { "wasm-gc" } else { "wasm" }
+            );
         }
         // Link target
         if link {
@@ -318,9 +345,15 @@ impl MoonBit {
             );
             moon_pkg.push_str("\npkgtype(kind: \"foreign_library\")\n\noptions(\n");
             moon_pkg.indent(1);
-            moon_pkg.push_str("link: {\n\"wasm\": {\n");
+            uwriteln!(
+                moon_pkg,
+                "link: {{\n{:?}: {{",
+                if self.opts.wasm_gc { "wasm-gc" } else { "wasm" }
+            );
             moon_pkg.push_str(&format!("\"export-memory-name\": \"{memory_name}\",\n"));
-            moon_pkg.push_str("\"heap-start-address\": 16,\n");
+            if !self.opts.wasm_gc {
+                moon_pkg.push_str("\"heap-start-address\": 16,\n");
+            }
             moon_pkg.push_str("\"exports\": [\n");
             moon_pkg.indent(1);
             let mut exports = self
@@ -372,6 +405,9 @@ impl MoonBit {
 ///   final export FFI module. Async helpers are emitted when required.
 impl WorldGenerator for MoonBit {
     fn preprocess(&mut self, resolve: &Resolve, world: WorldId) -> Result<()> {
+        if self.opts.wasm_gc {
+            self.pkg_resolver.reserved_alias = Some("witCabi");
+        }
         if world_contains_endpoint_fixed_length_list_combination(resolve, world) {
             anyhow::bail!(
                 "MoonBit async bindings do not yet support combining future or stream types with fixed-length lists"
@@ -471,7 +507,7 @@ impl WorldGenerator for MoonBit {
             wit_bindgen_core::generated_preamble(&mut ffi, VERSION);
             uwriteln!(ffi, "{}", fragment.ffi);
             for builtin in fragment.builtins {
-                uwriteln!(ffi, "{}", builtin);
+                uwriteln!(ffi, "{}", self.builtin(builtin));
             }
             files.push(&format!("{directory}/ffi.mbt"), indent(&ffi).as_bytes());
 
@@ -557,7 +593,7 @@ impl WorldGenerator for MoonBit {
         uwriteln!(ffi, "{}", self.import_world_fragment.ffi);
         builtins.extend(self.import_world_fragment.builtins.iter());
         for b in builtins.iter() {
-            uwriteln!(ffi, "{}", b);
+            uwriteln!(ffi, "{}", self.builtin(b));
         }
         files.push(
             &format!("{directory}/ffi_import.mbt"),
@@ -641,7 +677,7 @@ impl WorldGenerator for MoonBit {
 
             uwriteln!(&mut ffi, "{}", fragment.ffi);
             for b in fragment.builtins.iter() {
-                uwriteln!(ffi, "{}", b);
+                uwriteln!(ffi, "{}", self.builtin(b));
             }
             files.push(&format!("{directory}/ffi.mbt",), indent(&ffi).as_bytes());
         }
@@ -698,7 +734,7 @@ impl WorldGenerator for MoonBit {
             wit_bindgen_core::generated_preamble(&mut export, VERSION);
             uwriteln!(&mut export, "{}", fragment.ffi);
             for b in fragment.builtins.iter() {
-                uwriteln!(&mut export, "{}", b);
+                uwriteln!(&mut export, "{}", self.builtin(b));
             }
             files.push(&format!("{directory}/ffi.mbt",), indent(&export).as_bytes());
         }
@@ -712,15 +748,21 @@ impl WorldGenerator for MoonBit {
         self.opts.async_.ensure_all_used()?;
 
         // If async is used, export async utils
-        self.async_support.emit_runtime_files(files, VERSION);
+        let gc_cabi_package = self
+            .opts
+            .wasm_gc
+            .then(|| format!("{}/{}/cabi", self.project_name, self.opts.gen_dir));
+        self.async_support
+            .emit_runtime_files(files, VERSION, gc_cabi_package.as_deref());
 
         // Export project files
         if !self.opts.ignore_stub && !self.opts.ignore_module_file {
             let mut body = Source::default();
             uwriteln!(
                 &mut body,
-                "name = {:?}\n\npreferred_target = \"wasm\"",
-                self.project_name
+                "name = {:?}\n\npreferred_target = {:?}",
+                self.project_name,
+                if self.opts.wasm_gc { "wasm-gc" } else { "wasm" }
             );
             files.push("moon.mod", body.as_bytes());
         }
@@ -730,7 +772,15 @@ impl WorldGenerator for MoonBit {
         wit_bindgen_core::generated_preamble(&mut body, VERSION);
         // CABI Realloc
         for builtin in [ffi::CABI_REALLOC, ffi::MALLOC, ffi::FREE] {
-            uwriteln!(&mut body, "{}", builtin);
+            uwriteln!(&mut body, "{}", self.builtin(builtin));
+        }
+        if self.opts.wasm_gc {
+            let directory = format!("{}/cabi", self.opts.gen_dir);
+            files.push(
+                &format!("{directory}/runtime.mbt"),
+                gc::runtime().as_bytes(),
+            );
+            files.push(&format!("{directory}/moon.pkg"), b"import { \"moonbitlang/core/encoding/utf16\", }\nsupported_targets = \"wasm-gc\"\n");
         }
         // Import all exported interfaces
         for (_, (_, impl_)) in self.export.iter() {
@@ -749,7 +799,7 @@ impl WorldGenerator for MoonBit {
             wit_bindgen_core::generated_preamble(&mut ffi, VERSION);
             uwriteln!(ffi, "{}", self.export_lower_fragment.ffi);
             for builtin in &self.export_lower_fragment.builtins {
-                uwriteln!(ffi, "{}", builtin);
+                uwriteln!(ffi, "{}", self.builtin(builtin));
             }
             files.push(&format!("{directory}/ffi.mbt"), indent(&ffi).as_bytes());
 
@@ -1485,7 +1535,8 @@ impl InterfaceGenerator<'_> {
             &camel_name,
             &disambig,
             async_state,
-        ) && abi::guest_export_needs_post_return(self.resolve, func)
+        ) && (abi::guest_export_needs_post_return(self.resolve, func)
+            || (self.world_gen.opts.wasm_gc && sig.retptr))
         {
             let params = sig
                 .results
@@ -1505,6 +1556,10 @@ impl InterfaceGenerator<'_> {
 
             bindgen.outline_deallocations = true;
             abi::post_return(bindgen.interface_gen.resolve, func, &mut bindgen);
+            if bindgen.interface_gen.world_gen.opts.wasm_gc && sig.retptr {
+                bindgen.use_ffi(ffi::FREE);
+                uwriteln!(bindgen.src, "mbt_ffi_free(p0)");
+            }
 
             let src = bindgen.src;
 
@@ -2819,6 +2874,10 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                         let {result} = mbt_ffi_ptr2bytes({address}, {length})
                         ",
                     );
+                    if self.interface_gen.world_gen.opts.wasm_gc {
+                        self.use_ffi(ffi::FREE);
+                        uwriteln!(self.src, "mbt_ffi_free({address})");
+                    }
 
                     results.push(result);
                 }
@@ -2861,6 +2920,10 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                         let {result} = mbt_ffi_ptr2{ty}_array({address}, {length})
                         ",
                     );
+                    if self.interface_gen.world_gen.opts.wasm_gc {
+                        self.use_ffi(ffi::FREE);
+                        uwriteln!(self.src, "mbt_ffi_free({address})");
+                    }
 
                     results.push(result);
                 }
@@ -2898,6 +2961,10 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                     let {result} = mbt_ffi_ptr2str({address}, {length})
                     ",
                 );
+                if self.interface_gen.world_gen.opts.wasm_gc {
+                    self.use_ffi(ffi::FREE);
+                    uwriteln!(self.src, "mbt_ffi_free({address})");
+                }
 
                 results.push(result);
             }
@@ -4003,6 +4070,49 @@ mod tests {
             .iter()
             .map(|(name, contents)| (name.to_string(), contents.to_vec()))
             .collect()
+    }
+
+    #[test]
+    fn wasm_gc_selects_guest_target() {
+        let files = try_generate_with_opts(
+            "package test:gc; world probe { export count: func() -> u32; }",
+            "probe",
+            Opts {
+                wasm_gc: true,
+                gen_dir: "gen".into(),
+                ..Opts::default()
+            },
+        )
+        .unwrap();
+        assert!(file(&files, "moon.mod").contains("preferred_target = \"wasm-gc\""));
+        let package = file(&files, "gen/moon.pkg");
+        assert!(package.contains("supported_targets = \"wasm-gc\""));
+        assert!(package.contains("\"wasm-gc\": {"));
+        assert!(!package.contains("heap-start-address"));
+    }
+
+    #[test]
+    fn wasm_gc_generates_async_worlds() {
+        for declaration in [
+            "export run: async func();",
+            "import run: async func();",
+            "export run: func() -> future<u32>;",
+            "export run: func() -> stream<u8>;",
+        ] {
+            let result = try_generate_with_opts(
+                &format!("package test:gc; world probe {{ {declaration} }}"),
+                "probe",
+                Opts {
+                    wasm_gc: true,
+                    gen_dir: "gen".into(),
+                    ..Opts::default()
+                },
+            );
+            let files = result.unwrap();
+            assert!(
+                file(&files, "async-core/moon.pkg").contains("supported_targets = \"wasm-gc\"")
+            );
+        }
     }
 
     fn abi_helpers(source: &str) -> BTreeMap<String, String> {
@@ -5206,7 +5316,7 @@ mod tests {
             "service",
         );
 
-        let abi = file(&files, "async-core/async_abi.mbt");
+        let abi = file(&files, "async-core/async_poll.mbt");
         assert!(
             abi.contains("#borrow(array)\nextern \"wasm\" fn int_array2ptr"),
             "{abi}"

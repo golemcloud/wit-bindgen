@@ -97,11 +97,6 @@ fn Events::new(code : EventCode, i : Int, j : Int) -> Events {
 // #region waitable set
 
 ///|
-#borrow(array)
-extern "wasm" fn int_array2ptr(array : FixedArray[Int]) -> Int =
-  #|(func (param i32) (result i32) local.get 0)
-
-///|
 struct WaitableSet(Int) derive(Eq, Hash)
 
 ///|
@@ -120,13 +115,6 @@ fn WaitableSet::new() -> WaitableSet {
 ///|
 fn WaitableSet::drop(self : Self) -> Unit {
   waitable_set_drop(self.0)
-}
-
-///|
-fn WaitableSet::poll(self : Self) -> (Events, Int) {
-  let payload : FixedArray[Int] = FixedArray::make(2, 0)
-  let event = waitable_set_poll(self.0, int_array2ptr(payload))
-  (Events::new(EventCode::from(event), payload[0], payload[1]), payload[0])
 }
 
 // #endregion

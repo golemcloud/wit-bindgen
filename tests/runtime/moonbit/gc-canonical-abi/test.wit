@@ -1,0 +1,28 @@
+package test:gc-canonical-abi;
+
+interface values {
+  record payload {
+    text: string,
+    bytes: list<u8>,
+    signed-bytes: list<s8>,
+    shorts: list<s16>,
+    unsigned-shorts: list<u16>,
+    ints: list<s32>,
+    unsigned-ints: list<u32>,
+    longs: list<s64>,
+    unsigned-longs: list<u64>,
+    floats: list<f32>,
+    doubles: list<f64>,
+    bools: list<bool>,
+    chars: list<char>,
+    nested: list<option<string>>,
+  }
+  echo: func(value: payload) -> payload;
+  pages: func() -> u32;
+}
+
+world test { export values; }
+world runner {
+  import values;
+  export run: func();
+}

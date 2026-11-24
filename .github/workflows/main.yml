@@ -155,6 +155,30 @@ jobs:
           --artifacts target/artifacts \
           --rust-wit-bindgen-path ./crates/guest-rust
 
+  moonbit_abi:
+    name: MoonBit canonical and async ABI
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: true
+    - run: rustup target add wasm32-wasip1 wasm32-wasip2
+    - uses: ./.github/actions/install-wasi-sdk
+    - uses: hustcer/setup-moonbit@v1
+      with:
+        version: 0.10.18+6c83a7f62
+        core-version: 0.10.18+6c83a7f62
+    - run: cargo test --locked -p wit-bindgen-moonbit --lib
+    - run: |
+        cargo run --locked --no-default-features --features moonbit,rust -- test \
+          --languages moonbit,rust --rust-wit-bindgen-path ./crates/guest-rust \
+          --artifacts target/moonbit-abi --test-threads 1 \
+          tests/runtime/moonbit/gc-canonical-abi \
+          tests/runtime/moonbit/gc-async-abi \
+          tests/runtime/moonbit/byte-stream-batching \
+          tests/runtime/moonbit/nested-future-stream \
+          tests/runtime/moonbit/stream-write-cancel
+
   test_unit:
     name: Crate Unit Tests
     runs-on: ubuntu-latest

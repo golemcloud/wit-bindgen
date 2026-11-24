@@ -451,7 +451,12 @@ impl AsyncSupport {
         })
     }
 
-    pub(crate) fn emit_runtime_files(&self, files: &mut Files, version: &str) {
+    pub(crate) fn emit_runtime_files(
+        &self,
+        files: &mut Files,
+        version: &str,
+        gc_cabi_package: Option<&str>,
+    ) {
         if !self.is_required() {
             return;
         }
@@ -468,7 +473,22 @@ impl AsyncSupport {
                 s.src.as_bytes(),
             );
         });
-        files.push(&format!("{ASYNC_CORE_DIR}/moon.pkg"), ASYNC_PKG.as_bytes());
+        let poll = if gc_cabi_package.is_some() {
+            include_str!("gc/poll.mbt")
+        } else {
+            include_str!("async/poll.mbt")
+        };
+        files.push(&format!("{ASYNC_CORE_DIR}/async_poll.mbt"), poll.as_bytes());
+        let package = match gc_cabi_package {
+            Some(cabi) => ASYNC_PKG
+                .replacen("import {", &format!("import {{\n  {cabi:?} @witCabi,"), 1)
+                .replace(
+                    "supported_targets = \"wasm\"",
+                    "supported_targets = \"wasm-gc\"",
+                ),
+            None => ASYNC_PKG.to_string(),
+        };
+        files.push(&format!("{ASYNC_CORE_DIR}/moon.pkg"), package.as_bytes());
     }
 }
 
@@ -1266,10 +1286,11 @@ impl<'a> InterfaceGenerator<'a> {
         let elem_size = result_type
             .map(|ty| self.world_gen.sizes.size(ty).size_wasm32())
             .unwrap_or(0);
-        let read_chunk_owns_buffer = result_type.is_some_and(|ty| self.is_list_canonical(ty));
+        let canonical_list = result_type.is_some_and(|ty| self.is_list_canonical(ty));
+        let read_chunk_owns_buffer = canonical_list && !self.world_gen.opts.wasm_gc;
         let needs_lift = endpoint_use.lift
             && (matches!(site.kind, PayloadFor::Future)
-                || (result_type.is_some() && !read_chunk_owns_buffer));
+                || (result_type.is_some() && !canonical_list));
         let needs_list_lift = endpoint_use.lift && matches!(site.kind, PayloadFor::Stream);
         // Byte streams use a 64 KiB window; other fixed primitives use 4 KiB.
         // Aggregates retain the conservative element cap and byte budget,
